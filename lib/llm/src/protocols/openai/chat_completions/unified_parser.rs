@@ -38,8 +38,8 @@ use async_stream::stream;
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
     InvalidGuidedPayloadPolicy, Tool, UnifiedEvent, UnifiedParser, UnifiedParserEvent,
-    UnifiedParserExt, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState,
-    UnifiedToolOutputMode, create_unified_parser_for_family,
+    UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
+    create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -2230,7 +2230,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamo_parsers_v2::ToolCallDelta;
+    use dynamo_parsers_v2::{ToolCallDelta, UnifiedParserExt};
     use dynamo_protocols::types::{
         ChatCompletionStreamResponseDeltaFunctionCall, CreateChatCompletionStreamResponse, Role,
     };
