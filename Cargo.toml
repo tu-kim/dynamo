@@ -77,10 +77,8 @@ dynamo-kv-router = { path = "lib/kv-router", version = "1.6.0" }
 dynamo-protocols = { version = "=6.1.0" }
 dynamo-parsers = { version = "=9.2.6" }
 
-# Published on crates.io. To see all available versions:
-#   web:          https://crates.io/crates/dynamo-parsers-v2/versions
-#   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "=0.7.11" }
+# Qualification pin for the unpublished Kimi native-ID parser candidate.
+dynamo-parsers-v2 = { git = "https://github.com/ai-dynamo/frontend-crates", rev = "c66f1fa5ae90ee27dcec16f4153e4a34153c2f47", version = "=0.7.12" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.6.0" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.6.0" }
 

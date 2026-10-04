@@ -137,3 +137,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+# Keep standalone Python-binding builds on the exact parser candidate used by the root workspace.
+dynamo-parsers-v2 = { git = "https://github.com/ai-dynamo/frontend-crates", rev = "c66f1fa5ae90ee27dcec16f4153e4a34153c2f47" }

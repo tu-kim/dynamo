@@ -1411,13 +1411,13 @@ impl ChoiceState {
                 self.tool_emitted = true;
                 // The OpenAI streaming tool-call contract: the FIRST chunk for a tool
                 // index carries id + type + name, later chunks carry only argument
-                // fragments. `dynamo-parsers-v2` mints no ids (serving layers own them),
-                // so one is minted here per call, exactly once.
+                // fragments. Native IDs must survive into conversation history because
+                // some chat templates write the ID directly into the next native header.
                 let first = self.opened_calls.insert(call.tool_index);
                 let name = call.name.take();
                 choice.delta.tool_calls = Some(vec![ChatCompletionMessageToolCallChunk {
                     index: call.tool_index as u32,
-                    id: first.then(|| format!("call-{}", Uuid::new_v4())),
+                    id: first.then(|| response_tool_call_id(self.parser.as_ref(), call.tool_index)),
                     r#type: first.then_some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: first.then_some(name).flatten(),
@@ -1584,6 +1584,25 @@ pub(crate) fn parse_complete(
     )
 }
 
+fn response_tool_call_id(parser: &dyn UnifiedParser, tool_index: usize) -> String {
+    parser
+        .tool_call_id(tool_index)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()))
+}
+
+fn parse_indexed_output(
+    parser: &mut dyn UnifiedParser,
+    content: &str,
+) -> anyhow::Result<Vec<(Option<usize>, UnifiedEvent)>> {
+    let mut output = UnifiedParserOutput::default();
+    parser.parse_into(content, &mut output)?;
+    output.events.extend(parser.finish()?.events);
+    Ok(dynamo_parsers_v2::assemble_with_tool_indices(
+        &output.events,
+    ))
+}
+
 pub(crate) fn parse_complete_with_policy(
     family: &str,
     content: &str,
@@ -1609,7 +1628,7 @@ pub(crate) fn parse_complete_with_policy(
         ..UnifiedParserInit::default()
     })?;
 
-    let events = match parser.parse_complete(content) {
+    let events = match parse_indexed_output(parser.as_mut(), content) {
         Ok(events) => events,
         Err(error)
             if matches!(effective_mode, UnifiedToolOutputMode::GuidedJson { .. })
@@ -1625,7 +1644,7 @@ pub(crate) fn parse_complete_with_policy(
                 tool_output_mode: effective_mode.clone(),
                 ..UnifiedParserInit::default()
             })?;
-            parser.parse_complete(content)?
+            parse_indexed_output(parser.as_mut(), content)?
         }
         Err(error) => return Err(error),
     };
@@ -1638,7 +1657,7 @@ pub(crate) fn parse_complete_with_policy(
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    for event in events {
+    for (tool_index, event) in events {
         match event {
             UnifiedEvent::Text { text: chunk } => text.push_str(&chunk),
             UnifiedEvent::Reasoning { text: chunk } => {
@@ -1658,7 +1677,10 @@ pub(crate) fn parse_complete_with_policy(
                     continue;
                 }
                 tool_calls.push(ChatCompletionMessageToolCall {
-                    id: format!("call-{}", Uuid::new_v4()),
+                    id: response_tool_call_id(
+                        parser.as_ref(),
+                        tool_index.expect("assembled call index"),
+                    ),
                     r#type: FunctionType::Function,
                     // `assemble` already parsed the argument fragments into a typed
                     // object, so this re-serializes rather than passing the model's
@@ -3337,6 +3359,228 @@ mod tests {
             true,
         )
         .expect("qwen3 unified parser")
+    }
+
+    #[tokio::test]
+    async fn kimi_native_ids_survive_batch_and_every_stream_split() {
+        let raw = concat!(
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.get_weather:7<|tool_call_argument_begin|>{\"city\":\"Paris\"}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:9<|tool_call_argument_begin|>{\"city\":\"Paris\"}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:11<|tool_call_argument_begin|>{\"city\":\"Paris\"}<|tool_call_end|>",
+            "<|tool_calls_section_end|>"
+        );
+        let expected_ids = [
+            "functions.get_weather:7",
+            "functions.get_weather:9",
+            "functions.get_weather:11",
+        ];
+        let batch = parse_complete(
+            "kimi_k2",
+            raw,
+            &GuidedToolConstraint::None,
+            &weather_tools(),
+        )
+        .unwrap();
+        assert_eq!(
+            batch
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        for split in (0..=raw.len()).filter(|&at| raw.is_char_boundary(at)) {
+            let responses = apply_stream(
+                stream::iter([chunk(&raw[..split], false), chunk(&raw[split..], true)]),
+                Some(weather_tools()),
+                None,
+                false,
+                UnifiedParserStartingState::None,
+                "kimi_k2",
+            )
+            .collect::<Vec<_>>()
+            .await;
+            let choices = collect_choices(&responses);
+            let calls: Vec<_> = choices
+                .iter()
+                .flat_map(|c| c.delta.tool_calls.iter().flatten())
+                .collect();
+            assert_eq!(calls.len(), 3, "split {split}");
+            for (index, call) in calls.iter().enumerate() {
+                assert_eq!(call.index, index as u32);
+                assert_eq!(
+                    call.id.as_deref(),
+                    Some(expected_ids[index]),
+                    "split {split}"
+                );
+                assert_eq!(
+                    call.function.as_ref().unwrap().arguments.as_deref(),
+                    Some(batch.tool_calls[index].function.arguments.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_native_ids_survive_finish_and_guided_native_fallback() {
+        let body = "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:7<|tool_call_argument_begin|>{\"city\":\"Paris\"}";
+        let mut state = ChoiceState::new(
+            "kimi_k2",
+            &to_v2_tools(Some(&weather_tools())),
+            UnifiedParserStartingState::None,
+            UnifiedToolOutputMode::Native,
+            true,
+        )
+        .unwrap();
+        assert!(state.push(body).is_empty(), "recovery must wait for EOF");
+        let events = state.finish();
+        let choices = state.choices_for(&empty_choice(0), events, true, None);
+        assert_eq!(
+            choices[0].delta.tool_calls.as_ref().unwrap()[0]
+                .id
+                .as_deref(),
+            Some("functions.get_weather:7")
+        );
+        for constraint in [
+            GuidedToolConstraint::None,
+            GuidedToolConstraint::GuidedJsonRequired,
+            GuidedToolConstraint::GuidedJsonNamed {
+                tool_name: "get_weather".into(),
+            },
+        ] {
+            let parsed = parse_complete("kimi_k2", body, &constraint, &weather_tools()).unwrap();
+            assert_eq!(parsed.tool_calls[0].id, "functions.get_weather:7");
+        }
+        let guided = parse_complete(
+            "kimi_k2",
+            "[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]",
+            &GuidedToolConstraint::GuidedJsonRequired,
+            &weather_tools(),
+        )
+        .unwrap();
+        assert!(
+            guided.tool_calls[0].id.starts_with("call-"),
+            "guided JSON supplies no native ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_native_ids_are_choice_local_including_prefilled_reasoning() {
+        for prefill in [
+            UnifiedParserStartingState::None,
+            UnifiedParserStartingState::Reasoning,
+        ] {
+            let prefix = if prefill == UnifiedParserStartingState::Reasoning {
+                "check</think>"
+            } else {
+                "<think>check</think>"
+            };
+            let raw = format!(
+                "{prefix}<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:7<|tool_call_argument_begin|>{{\"city\":\"Paris\"}}<|tool_call_end|><|tool_calls_section_end|>"
+            );
+            let mut frame = chunk(&raw, false);
+            let choices = &mut frame.data.as_mut().unwrap().inner.choices;
+            let mut other = choices[0].clone();
+            other.index = 1;
+            other.delta.content = Some(ChatCompletionMessageContent::Text(raw.replace(":7", ":9")));
+            choices.push(other);
+            let responses = apply_stream(
+                stream::iter([frame]),
+                Some(weather_tools()),
+                None,
+                false,
+                prefill,
+                "kimi_k2",
+            )
+            .collect::<Vec<_>>()
+            .await;
+            let choices = collect_choices(&responses);
+            for (index, expected_id) in [
+                (0, "functions.get_weather:7"),
+                (1, "functions.get_weather:9"),
+            ] {
+                let for_choice: Vec<_> = choices.iter().filter(|c| c.index == index).collect();
+                let calls: Vec<_> = for_choice
+                    .iter()
+                    .flat_map(|c| c.delta.tool_calls.iter().flatten())
+                    .collect();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].index, 0);
+                assert_eq!(calls[0].id.as_deref(), Some(expected_id));
+                assert_eq!(
+                    for_choice
+                        .iter()
+                        .filter_map(|c| c.delta.reasoning_content.as_deref())
+                        .collect::<String>(),
+                    "check"
+                );
+                assert_eq!(
+                    for_choice
+                        .iter()
+                        .filter_map(|c| c.finish_reason)
+                        .collect::<Vec<_>>(),
+                    vec![FinishReason::ToolCalls]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_native_ids_correlate_tool_results_in_cached_template() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/data/kimi_k26/multi_turn_base_0.json"
+        ))
+        .unwrap();
+        let parsed = parse_complete(
+            "kimi_k2",
+            fixture["generation"].as_str().unwrap(),
+            &GuidedToolConstraint::None,
+            &[],
+        )
+        .unwrap();
+        let messages = serde_json::json!([
+            {"role":"user", "content":fixture["user"]},
+            {"role":"assistant", "content":parsed.text, "reasoning_content":parsed.reasoning, "tool_calls":parsed.tool_calls},
+            {"role":"tool", "tool_call_id":parsed.tool_calls[0].id, "content":fixture["tool_result"]},
+            {"role":"user", "content":"Continue."}
+        ]);
+        let config = serde_json::from_value(serde_json::json!({"chat_template":include_str!("../../../../tests/data/kimi_k26/chat_template.jinja")})).unwrap();
+        let dynamo_renderer::PromptFormatter::OAI(formatter) =
+            dynamo_renderer::PromptFormatter::from_parts(
+                config,
+                dynamo_renderer::ContextMixins::new(&[]),
+                false,
+            )
+            .unwrap();
+        let request: crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"model":"kimi", "messages":messages}))
+                .unwrap();
+        let prompt = formatter.render(&request).unwrap();
+        assert!(
+            prompt.contains("<|tool_call_begin|>functions.cd:0<|tool_call_argument_begin|>"),
+            "native header missing"
+        );
+        let start = prompt.find("<|tool_calls_section_begin|>").unwrap();
+        let end = prompt[start..].find("<|tool_calls_section_end|>").unwrap()
+            + start
+            + "<|tool_calls_section_end|>".len();
+        let history = parse_complete(
+            "kimi_k2",
+            &prompt[start..end],
+            &GuidedToolConstraint::None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(history.tool_calls, parsed.tool_calls);
+        assert!(prompt.contains("## Return of functions.cd:0"));
+        assert!(!prompt.contains("<|tool_call_begin|>call-"));
+        let mut expected = request.clone();
+        let mut expected_messages = messages;
+        expected_messages[1]["tool_calls"][0]["id"] = serde_json::json!("functions.cd:0");
+        expected_messages[2]["tool_call_id"] = serde_json::json!("functions.cd:0");
+        expected.inner.messages = serde_json::from_value(expected_messages).unwrap();
+        assert_eq!(prompt, formatter.render(&expected).unwrap());
     }
 
     #[test]
