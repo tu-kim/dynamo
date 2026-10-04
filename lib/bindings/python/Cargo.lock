@@ -2371,12 +2371,11 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.7.8"
+version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45d61fb15b595ab1ae0db5cb92e7036b8b30caed37138975434fb50ecb4d1d25"
+checksum = "bc1442cec465d9f83f36d552592e5e9c461e9df4269ec2ff6c27ef29689666d7"
 dependencies = [
  "anyhow",
- "num-traits",
  "openai-harmony",
  "percent-encoding",
  "regex",
