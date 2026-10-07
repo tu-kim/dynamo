@@ -96,6 +96,34 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 )
                                 .await;
                         }
+                        KvCacheEventData::Chunk(_) => {
+                            // ComposableKV: keep ordering with the block events around it,
+                            // but never merge or dedup it.
+                            batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
+                            let event = placement_event.event;
+                            let applied = emit(
+                                &local_indexer,
+                                worker_id,
+                                storage_tier,
+                                residency_domain,
+                                KvCacheEvent {
+                                    event_id: batching_state.next_publish_id,
+                                    data: event.data,
+                                    dp_rank: event.dp_rank,
+                                },
+                                &mut output,
+                            )
+                            .await;
+                            if applied {
+                                batching_state.next_publish_id = batching_state
+                                    .next_publish_id
+                                    .checked_add(1)
+                                    .expect("KV event publisher outbound cursor exhausted");
+                            } else {
+                                output.pop();
+                                tracing::warn!(worker_id, "Dropping chunk event the local indexer rejected");
+                            }
+                        }
                         KvCacheEventData::Cleared => {
                             batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
                             let event = placement_event.event;

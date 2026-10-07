@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::protocols::{
-    BlockExtraInfo, BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+    BlockExtraInfo, BlockHashOptions, ChunkEventData, ChunkEventKind, ChunkMedium,
+    ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
     KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement, PlacementEvent,
     StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
@@ -23,6 +24,22 @@ pub fn convert_event(
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
 ) -> Option<PlacementEvent> {
+    // ComposableKV chunk events carry their own medium (GPU PI pool / node DRAM)
+    // and never enter the prefix trees: convert them first, before the
+    // block-event tier/locality gates.
+    if raw.is_chunk() {
+        return chunk_event_data(&raw).map(|data| {
+            PlacementEvent::new(
+                Placement::local_worker(worker.worker_id, worker.dp_rank, StorageTier::Device),
+                KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Chunk(data),
+                    dp_rank: worker.dp_rank,
+                },
+            )
+        });
+    }
+
     // Read the wire tier/locality facts up front, before any indexing work.
     let (medium, locality) = match &raw {
         RawKvEvent::BlockStored {
@@ -32,6 +49,9 @@ pub fn convert_event(
             medium, locality, ..
         } => (medium.as_deref(), *locality),
         RawKvEvent::AllBlocksCleared { .. } => (None, None),
+        RawKvEvent::ChunkStored { .. }
+        | RawKvEvent::ChunkRemoved { .. }
+        | RawKvEvent::ChunksCleared { .. } => unreachable!("chunk events convert above"),
         RawKvEvent::Ignored => return None,
     };
 
@@ -159,6 +179,9 @@ pub fn convert_event(
             data: KvCacheEventData::Cleared,
             dp_rank,
         },
+        RawKvEvent::ChunkStored { .. }
+        | RawKvEvent::ChunkRemoved { .. }
+        | RawKvEvent::ChunksCleared { .. } => unreachable!("chunk events convert above"),
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),
     };
 
@@ -166,6 +189,37 @@ pub fn convert_event(
         Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
         event,
     ))
+}
+
+/// `Some` for the ComposableKV chunk variants (None if the medium is unknown,
+/// which drops the event like an unknown block medium).
+fn chunk_event_data(raw: &RawKvEvent) -> Option<ChunkEventData> {
+    let (kind, chunk_hash, offset, num_tokens, medium) = match raw {
+        RawKvEvent::ChunkStored {
+            chunk_hash,
+            offset,
+            num_tokens,
+            medium,
+        } => (ChunkEventKind::Stored, chunk_hash.clone(), *offset, *num_tokens, medium),
+        RawKvEvent::ChunkRemoved {
+            chunk_hash,
+            offset,
+            medium,
+        } => (ChunkEventKind::Removed, chunk_hash.clone(), *offset, 0, medium),
+        RawKvEvent::ChunksCleared { medium } => (ChunkEventKind::Cleared, String::new(), 0, 0, medium),
+        _ => return None,
+    };
+    let Some(medium) = ChunkMedium::from_wire(medium) else {
+        tracing::warn!(medium, "Dropping chunk event with unknown medium");
+        return None;
+    };
+    Some(ChunkEventData {
+        kind,
+        chunk_hash,
+        offset,
+        num_tokens,
+        medium,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

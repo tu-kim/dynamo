@@ -301,6 +301,7 @@ impl ConcurrentRadixTree {
                 self.remove_worker_dp_rank(lookup, worker.worker_id, worker.dp_rank);
                 Ok(())
             }
+            KvCacheEventData::Chunk(_) => Ok(()), // ComposableKV: PiIndex only
         }
     }
 

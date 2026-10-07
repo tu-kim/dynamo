@@ -39,6 +39,7 @@ pub use self::embedding_cache::{
 };
 pub(crate) use self::recording::ApproximateRequestLease;
 use self::remote::RemoteIndexer;
+pub use dynamo_kv_router::indexer::PiIndex;
 pub use self::remote::{ServedIndexerHandle, ServedIndexerMode, ensure_served_indexer_service};
 pub use self::side::SideIndexer;
 #[cfg(feature = "ckf-diagnostics")]
@@ -69,17 +70,21 @@ pub enum Indexer {
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        /// ComposableKV PI index (D-IDX), alongside the prefix trees.
+        pi: Arc<PiIndex>,
     },
     Concurrent {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        pi: Arc<PiIndex>,
     },
     Remote {
         primary: Arc<RemoteIndexer>,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
+        pi: Arc<PiIndex>,
     },
     None,
 }
@@ -221,6 +226,7 @@ impl Indexer {
                 primary: Arc::new(remote),
                 approx,
                 primary_records_routing_decisions: !kv_router_config.use_kv_events,
+                pi: Arc::new(PiIndex::new()),
             });
         }
 
@@ -257,6 +263,7 @@ impl Indexer {
                     ),
                     approx: None,
                     primary_records_routing_decisions: true,
+                    pi: Arc::new(PiIndex::new()),
                 });
             }
 
@@ -274,6 +281,7 @@ impl Indexer {
                 ),
                 approx: None,
                 primary_records_routing_decisions: true,
+                pi: Arc::new(PiIndex::new()),
             });
         }
 
@@ -300,6 +308,7 @@ impl Indexer {
                 ),
                 approx,
                 primary_records_routing_decisions: false,
+                pi: Arc::new(PiIndex::new()),
             });
         }
 
@@ -318,6 +327,7 @@ impl Indexer {
             ),
             approx,
             primary_records_routing_decisions: false,
+            pi: Arc::new(PiIndex::new()),
         })
     }
 
@@ -340,7 +350,29 @@ impl Indexer {
         }
     }
 
+    /// ComposableKV PI index (None when no indexer is configured).
+    pub fn pi_index(&self) -> Option<Arc<PiIndex>> {
+        match self {
+            Self::KvIndexer { pi, .. } | Self::Concurrent { pi, .. } | Self::Remote { pi, .. } => {
+                Some(Arc::clone(pi))
+            }
+            Self::None => None,
+        }
+    }
+
     pub(crate) async fn try_apply_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        if let KvCacheEventData::Chunk(data) = &event.event.data {
+            if let Some(pi) = self.pi_index() {
+                pi.apply(
+                    dynamo_kv_router::protocols::WorkerWithDpRank::new(
+                        event.worker_id,
+                        event.event.dp_rank,
+                    ),
+                    data,
+                );
+            }
+            return Ok(());
+        }
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -426,6 +458,9 @@ impl Indexer {
         worker_id: WorkerId,
         dp_rank: DpRank,
     ) -> Result<(), KvRouterError> {
+        if let Some(pi) = self.pi_index() {
+            pi.remove_worker_dp_rank(worker_id, dp_rank);
+        }
         match self {
             Self::KvIndexer {
                 primary,
@@ -599,6 +634,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(1, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            pi: Arc::new(PiIndex::new()),
         }
     }
 
@@ -612,6 +648,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: false,
+            pi: Arc::new(PiIndex::new()),
         }
     }
 
@@ -628,6 +665,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: true,
+            pi: Arc::new(PiIndex::new()),
         }
     }
 
@@ -1036,6 +1074,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            pi: Arc::new(PiIndex::new()),
         };
         assert!(indexer.records_routing_decisions());
 
@@ -1167,6 +1206,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
+            pi: Arc::new(PiIndex::new()),
         };
 
         let primary_worker = WorkerWithDpRank::new(10, 0);

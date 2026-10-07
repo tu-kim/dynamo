@@ -2157,6 +2157,11 @@ where
     pub async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
         self.indexer.dump_events().await
     }
+
+    /// ComposableKV PI index (which ranks hold which PI chunks).
+    pub fn pi_index(&self) -> Option<Arc<crate::kv_router::indexer::PiIndex>> {
+        self.indexer.pi_index()
+    }
 }
 
 // NOTE: KVRouter works like a PushRouter,

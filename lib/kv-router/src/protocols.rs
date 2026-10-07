@@ -1238,6 +1238,61 @@ pub enum KvCacheEventData {
     /// This is ordered only within that rank publisher's event sequence. Worker-wide removal is
     /// a separate serving-membership lifecycle operation.
     Cleared,
+    /// ComposableKV: a position-independent KV chunk entered or left the rank's
+    /// PI pool (GPU) or the node DRAM store. Never touches the prefix trees;
+    /// indexed by `indexer::PiIndex`.
+    Chunk(ChunkEventData),
+}
+
+/// ComposableKV chunk event (vLLM `ChunkStored` / `ChunkRemoved` / `ChunksCleared`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChunkEventData {
+    pub kind: ChunkEventKind,
+    /// Empty for `Cleared`.
+    pub chunk_hash: String,
+    /// Absolute prompt position the chunk's K was rotated to; 0 for the DRAM original.
+    pub offset: u32,
+    /// 0 for `Removed` / `Cleared`.
+    pub num_tokens: u32,
+    pub medium: ChunkMedium,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkEventKind {
+    Stored,
+    Removed,
+    Cleared,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkMedium {
+    Gpu,
+    Dram,
+}
+
+impl ChunkMedium {
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "GPU" => Some(Self::Gpu),
+            "DRAM" => Some(Self::Dram),
+            _ => None,
+        }
+    }
+
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Gpu => "GPU",
+            Self::Dram => "DRAM",
+        }
+    }
+}
+
+impl KvCacheEventData {
+    pub fn is_chunk(&self) -> bool {
+        matches!(self, Self::Chunk(_))
+    }
 }
 
 /// Represents the data associated with a stored cache event.

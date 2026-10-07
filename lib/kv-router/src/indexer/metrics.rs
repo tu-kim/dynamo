@@ -32,6 +32,8 @@ pub enum EventKind {
     Stored,
     Removed,
     Cleared,
+    /// ComposableKV chunk event (PI index).
+    Chunk,
 }
 
 impl EventKind {
@@ -40,6 +42,7 @@ impl EventKind {
             KvCacheEventData::Stored(_) => Self::Stored,
             KvCacheEventData::Removed(_) => Self::Removed,
             KvCacheEventData::Cleared => Self::Cleared,
+            KvCacheEventData::Chunk(_) => Self::Chunk,
         }
     }
 
@@ -48,6 +51,7 @@ impl EventKind {
             Self::Stored => METRIC_EVENT_STORED,
             Self::Removed => METRIC_EVENT_REMOVED,
             Self::Cleared => METRIC_EVENT_CLEARED,
+            Self::Chunk => "chunk",
         }
     }
 }
@@ -522,6 +526,7 @@ impl PreBoundEventCounters {
                 EventKind::Stored => &self.inner.stored,
                 EventKind::Removed => &self.inner.removed,
                 EventKind::Cleared => &self.inner.cleared,
+                EventKind::Chunk => return, // ComposableKV: not a tree mutation
             };
             counters.for_result(result).inc();
         }

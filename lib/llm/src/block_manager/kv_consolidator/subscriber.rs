@@ -272,6 +272,9 @@ fn process_event(
             tracker.handle_clear_all();
         }
 
+        RawKvEvent::ChunkStored { .. }
+        | RawKvEvent::ChunkRemoved { .. }
+        | RawKvEvent::ChunksCleared { .. } => {} // ComposableKV: PI chunks are not consolidated
         RawKvEvent::Ignored => {}
     }
 }

@@ -64,6 +64,7 @@ enum KvEventSummary {
         last: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
     },
     Cleared,
+    Chunk,
 }
 
 impl KvEventSummary {
@@ -82,6 +83,7 @@ impl KvEventSummary {
                 last: removed.block_hashes.last().copied(),
             },
             dynamo_kv_router::protocols::KvCacheEventData::Cleared => Self::Cleared,
+            dynamo_kv_router::protocols::KvCacheEventData::Chunk(_) => Self::Chunk,
         }
     }
 }
@@ -104,6 +106,7 @@ impl fmt::Display for KvEventSummary {
                 "removed count={count} first={first:?} last={last:?}"
             ),
             Self::Cleared => formatter.write_str("cleared"),
+            Self::Chunk => formatter.write_str("chunk"),
         }
     }
 }

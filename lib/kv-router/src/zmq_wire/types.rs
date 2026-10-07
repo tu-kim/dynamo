@@ -146,6 +146,21 @@ pub enum RawKvEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ownership: Option<String>,
     },
+    /// ComposableKV chunk events (vLLM `ChunkStored` / `ChunkRemoved` / `ChunksCleared`).
+    ChunkStored {
+        chunk_hash: String,
+        offset: u32,
+        num_tokens: u32,
+        medium: String,
+    },
+    ChunkRemoved {
+        chunk_hash: String,
+        offset: u32,
+        medium: String,
+    },
+    ChunksCleared {
+        medium: String,
+    },
     Ignored,
 }
 
@@ -155,12 +170,22 @@ impl RawKvEvent {
             Self::BlockStored { .. } => "stored",
             Self::BlockRemoved { .. } => "removed",
             Self::AllBlocksCleared { .. } => "cleared",
+            Self::ChunkStored { .. } => "chunk_stored",
+            Self::ChunkRemoved { .. } => "chunk_removed",
+            Self::ChunksCleared { .. } => "chunks_cleared",
             Self::Ignored => "ignored",
         }
     }
 
     pub fn is_ignored(&self) -> bool {
         matches!(self, Self::Ignored)
+    }
+
+    pub fn is_chunk(&self) -> bool {
+        matches!(
+            self,
+            Self::ChunkStored { .. } | Self::ChunkRemoved { .. } | Self::ChunksCleared { .. }
+        )
     }
 
     /// Wire `medium` string for store/remove events, if present. Lets the
@@ -171,7 +196,11 @@ impl RawKvEvent {
             Self::BlockStored { medium, .. } | Self::BlockRemoved { medium, .. } => {
                 medium.as_deref()
             }
-            Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::AllBlocksCleared { .. }
+            | Self::ChunkStored { .. }
+            | Self::ChunkRemoved { .. }
+            | Self::ChunksCleared { .. }
+            | Self::Ignored => None,
         }
     }
 
@@ -180,7 +209,11 @@ impl RawKvEvent {
     pub fn locality(&self) -> Option<Locality> {
         match self {
             Self::BlockStored { locality, .. } | Self::BlockRemoved { locality, .. } => *locality,
-            Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::AllBlocksCleared { .. }
+            | Self::ChunkStored { .. }
+            | Self::ChunkRemoved { .. }
+            | Self::ChunksCleared { .. }
+            | Self::Ignored => None,
         }
     }
 
@@ -193,14 +226,22 @@ impl RawKvEvent {
             Self::BlockStored { ownership, .. }
             | Self::BlockRemoved { ownership, .. }
             | Self::AllBlocksCleared { ownership } => ownership.as_deref(),
-            Self::Ignored => None,
+            Self::ChunkStored { .. }
+            | Self::ChunkRemoved { .. }
+            | Self::ChunksCleared { .. }
+            | Self::Ignored => None,
         }
     }
 
     pub fn block_size(&self) -> Option<usize> {
         match self {
             Self::BlockStored { block_size, .. } => Some(*block_size),
-            Self::BlockRemoved { .. } | Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::BlockRemoved { .. }
+            | Self::AllBlocksCleared { .. }
+            | Self::ChunkStored { .. }
+            | Self::ChunkRemoved { .. }
+            | Self::ChunksCleared { .. }
+            | Self::Ignored => None,
         }
     }
 
@@ -222,7 +263,11 @@ impl RawKvEvent {
                 kv_cache_spec_kind: *kv_cache_spec_kind,
                 kv_cache_spec_sliding_window: *kv_cache_spec_sliding_window,
             },
-            Self::AllBlocksCleared { .. } | Self::Ignored => KvCacheEventMetadata::default(),
+            Self::AllBlocksCleared { .. }
+            | Self::ChunkStored { .. }
+            | Self::ChunkRemoved { .. }
+            | Self::ChunksCleared { .. }
+            | Self::Ignored => KvCacheEventMetadata::default(),
         }
     }
 }

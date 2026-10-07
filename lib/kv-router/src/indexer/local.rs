@@ -210,6 +210,9 @@ impl RecoverySnapshotCache {
 pub struct LocalKvIndexer {
     /// The underlying indexer
     indexer: KvIndexer,
+    /// ComposableKV: PI chunks this rank holds (GPU pool / DRAM), fed by
+    /// `KvCacheEventData::Chunk`; dumped with the trees for recovery.
+    pi: Arc<super::PiIndex>,
     /// Lazily-created exact lower-tier indexes partitioned by storage tier.
     lower_tier_indexers: LowerTierRegistry,
     /// Circular buffer of recent events.
@@ -242,6 +245,7 @@ impl LocalKvIndexer {
     ) -> Self {
         Self {
             indexer: KvIndexer::new(token, kv_block_size, metrics.clone()),
+            pi: Arc::new(super::PiIndex::new()),
             metrics,
             lower_tier_indexers: Arc::new(Mutex::new(HashMap::new())),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(max_buffer_size))),
@@ -581,6 +585,7 @@ impl LocalKvIndexer {
     ) -> tokio::task::JoinHandle<BuildTaskResult> {
         let indexer = self.indexer.clone();
         let lower_tier_indexers = self.lower_tier_indexers.clone();
+        let pi = Arc::clone(&self.pi);
         let event_buffer = self.event_buffer.clone();
         let recovery_cache = self.recovery_cache.clone();
         #[cfg(test)]
@@ -595,7 +600,7 @@ impl LocalKvIndexer {
             }
 
             let build_output =
-                Self::build_fresh_dump(indexer, lower_tier_indexers, event_buffer, last_event_id)
+                Self::build_fresh_dump(indexer, lower_tier_indexers, pi, event_buffer, last_event_id)
                     .await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
@@ -608,6 +613,7 @@ impl LocalKvIndexer {
     async fn build_fresh_dump(
         indexer: KvIndexer,
         lower_tier_indexers: LowerTierRegistry,
+        pi: Arc<super::PiIndex>,
         event_buffer: Arc<Mutex<VecDeque<RouterEvent>>>,
         fallback_last_event_id: u64,
     ) -> FreshDumpOutput {
@@ -616,7 +622,7 @@ impl LocalKvIndexer {
             .unwrap()
             .back()
             .map_or(fallback_last_event_id, |event| event.event.event_id);
-        match Self::dump_all_tiers(&indexer, &lower_tier_indexers).await {
+        match Self::dump_all_tiers(&indexer, &lower_tier_indexers, &pi).await {
             Ok(events) => {
                 let represented_blocks = events
                     .iter()
@@ -660,6 +666,7 @@ impl LocalKvIndexer {
     async fn dump_all_tiers(
         indexer: &KvIndexer,
         lower_tier_indexers: &LowerTierRegistry,
+        pi: &super::PiIndex,
     ) -> Result<Vec<RouterEvent>, KvRouterError> {
         let lower_tiers: Vec<_> = {
             let indexers = lower_tier_indexers.lock().unwrap();
@@ -687,6 +694,18 @@ impl LocalKvIndexer {
                 event
             }));
         }
+        // ComposableKV: PI entries ride along as Chunk(Stored) events so a router
+        // rebuilding from this dump restores its PiIndex too.
+        events.extend(pi.dump().into_iter().map(|(worker, data)| {
+            RouterEvent::new(
+                worker.worker_id,
+                KvCacheEvent {
+                    event_id: 0,
+                    data: KvCacheEventData::Chunk(data),
+                    dp_rank: worker.dp_rank,
+                },
+            )
+        }));
         Ok(events)
     }
 
@@ -739,7 +758,19 @@ impl LocalKvIndexer {
             .enqueue_event(event)
     }
 
+    /// ComposableKV PI index of this rank.
+    pub fn pi_index(&self) -> Arc<super::PiIndex> {
+        Arc::clone(&self.pi)
+    }
+
     async fn apply_event_by_tier(&self, event: &RouterEvent) -> Result<(), KvRouterError> {
+        if let KvCacheEventData::Chunk(data) = &event.event.data {
+            self.pi.apply(
+                WorkerWithDpRank::new(event.worker_id, event.event.dp_rank),
+                data,
+            );
+            return Ok(());
+        }
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -833,7 +864,7 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
-        Self::dump_all_tiers(&self.indexer, &self.lower_tier_indexers).await
+        Self::dump_all_tiers(&self.indexer, &self.lower_tier_indexers, &self.pi).await
     }
 
     async fn process_routing_decision_for_request(

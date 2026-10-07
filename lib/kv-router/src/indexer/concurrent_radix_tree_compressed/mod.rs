@@ -239,6 +239,7 @@ impl ConcurrentRadixTreeCompressed {
                 self.erase_worker_coverage(lookup, WorkerRemovalTarget::DpRank(worker), true);
                 Ok(())
             }
+            KvCacheEventData::Chunk(_) => Ok(()), // ComposableKV: PiIndex only
         }
     }
 }

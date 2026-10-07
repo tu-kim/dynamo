@@ -8,9 +8,9 @@ use rmp_serde::{from_slice, to_vec, to_vec_named};
 use serde::Serialize;
 
 use crate::protocols::{
-    BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, PlacementEvent, PlacementOwner, StorageTier, WorkerWithDpRank,
-    compute_block_hash_for_seq,
+    BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ChunkEventKind, ChunkMedium,
+    ExternalSequenceBlockHash, KvCacheEventData, PlacementEvent, PlacementOwner, StorageTier,
+    WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -1523,4 +1523,109 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
         panic!("expected BlockStored");
     };
     assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
+}
+
+// ---- ComposableKV chunk events -------------------------------------------------
+
+#[derive(Serialize)]
+struct MapChunkStoredFixture {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    chunk_hash: &'static str,
+    offset: u32,
+    num_tokens: u32,
+    medium: &'static str,
+}
+
+#[derive(Serialize)]
+struct MapChunksClearedFixture {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    medium: &'static str,
+}
+
+#[test]
+fn t5_1_chunk_events_decode_from_map_and_sequence_forms() {
+    // vLLM msgspec (tag=True, map form)
+    let stored = to_vec_named(&MapChunkStoredFixture {
+        event_type: "ChunkStored",
+        chunk_hash: "8ad48c2262a60db71e45cca2aa0821e5",
+        offset: 32,
+        num_tokens: 1392,
+        medium: "GPU",
+    })
+    .unwrap();
+    let ev: RawKvEvent = from_slice(&stored).unwrap();
+    assert!(matches!(
+        &ev,
+        RawKvEvent::ChunkStored { chunk_hash, offset: 32, num_tokens: 1392, medium }
+            if chunk_hash == "8ad48c2262a60db71e45cca2aa0821e5" && medium == "GPU"
+    ), "{ev:?}");
+    assert!(ev.is_chunk());
+    assert_eq!(ev.medium(), None, "chunk media must not hit the block-tier gate");
+
+    let cleared = to_vec_named(&MapChunksClearedFixture {
+        event_type: "ChunksCleared",
+        medium: "GPU",
+    })
+    .unwrap();
+    let ev: RawKvEvent = from_slice(&cleared).unwrap();
+    assert!(matches!(&ev, RawKvEvent::ChunksCleared { medium } if medium == "GPU"), "{ev:?}");
+
+    // array_like form: [tag, chunk_hash, offset, medium]
+    let removed = to_vec(&("ChunkRemoved", "abcd", 0u32, "DRAM")).unwrap();
+    let ev: RawKvEvent = from_slice(&removed).unwrap();
+    assert!(matches!(
+        &ev,
+        RawKvEvent::ChunkRemoved { chunk_hash, offset: 0, medium }
+            if chunk_hash == "abcd" && medium == "DRAM"
+    ), "{ev:?}");
+}
+
+#[test]
+fn t5_1_chunk_events_convert_to_chunk_data_without_touching_block_gates() {
+    let worker = WorkerWithDpRank::new(7, 1);
+    let warnings = Arc::new(AtomicU32::new(0));
+    let placed = convert_event(
+        RawKvEvent::ChunkStored {
+            chunk_hash: "abcd".to_string(),
+            offset: 32,
+            num_tokens: 64,
+            medium: "gpu".to_string(),
+        },
+        11,
+        16,
+        worker,
+        &warnings,
+        None,
+        None,
+    )
+    .expect("chunk event converts");
+    assert_eq!(placed.event.event_id, 11);
+    assert_eq!(placed.event.dp_rank, 1);
+    match placed.event.data {
+        KvCacheEventData::Chunk(data) => {
+            assert_eq!(data.kind, ChunkEventKind::Stored);
+            assert_eq!(data.chunk_hash, "abcd");
+            assert_eq!(data.offset, 32);
+            assert_eq!(data.num_tokens, 64);
+            assert_eq!(data.medium, ChunkMedium::Gpu);
+        }
+        other => panic!("expected Chunk, got {other:?}"),
+    }
+    // Unknown medium: dropped, like an unknown block medium.
+    assert!(
+        convert_event(
+            RawKvEvent::ChunksCleared {
+                medium: "TAPE".to_string()
+            },
+            12,
+            16,
+            worker,
+            &warnings,
+            None,
+            None,
+        )
+        .is_none()
+    );
 }

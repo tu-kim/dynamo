@@ -246,6 +246,7 @@ impl RadixTree {
                 self.remove_worker_dp_rank(worker.worker_id, worker.dp_rank);
                 Ok(())
             }
+            KvCacheEventData::Chunk(_) => Ok(()), // ComposableKV: PiIndex only
         }
     }
 

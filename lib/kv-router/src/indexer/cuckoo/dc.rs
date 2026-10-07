@@ -573,6 +573,7 @@ impl DcCkfState {
                     retain_first_error(&mut first_error, error);
                 }
             }
+            KvCacheEventData::Chunk(_) => {} // ComposableKV: PiIndex only
         }
         self.telemetry.unknown_removals = self
             .telemetry

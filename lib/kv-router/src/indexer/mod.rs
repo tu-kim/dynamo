@@ -66,6 +66,7 @@ mod lower_tier_indexers;
 mod metrics;
 #[cfg(feature = "bench")]
 mod observation;
+pub mod pi_index;
 mod thread_pool;
 mod traits;
 mod types;
@@ -90,6 +91,7 @@ pub use lower_tier_indexers::*;
 pub use metrics::*;
 #[cfg(feature = "bench")]
 pub use observation::*;
+pub use pi_index::*;
 pub use thread_pool::*;
 pub use traits::*;
 pub use types::*;

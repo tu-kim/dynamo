@@ -57,11 +57,24 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
         let mut locality: Option<Option<Locality>> = None;
         let mut ownership: Option<Option<String>> = None;
         let mut metadata = KvCacheEventMetadata::default();
+        // ComposableKV chunk events
+        let mut chunk_hash: Option<String> = None;
+        let mut offset: Option<u32> = None;
+        let mut num_tokens: Option<u32> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
                     event_type = Some(map.next_value()?);
+                }
+                "chunk_hash" => {
+                    chunk_hash = Some(map.next_value()?);
+                }
+                "offset" => {
+                    offset = Some(map.next_value()?);
+                }
+                "num_tokens" => {
+                    num_tokens = Some(map.next_value()?);
                 }
                 "block_hashes" => {
                     block_hashes = Some(map.next_value()?);
@@ -163,9 +176,31 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 ownership: ownership.unwrap_or(None),
             }),
             Some("Ignored") => Ok(RawKvEvent::Ignored),
+            Some("ChunkStored") => Ok(RawKvEvent::ChunkStored {
+                chunk_hash: chunk_hash.ok_or_else(|| de::Error::missing_field("chunk_hash"))?,
+                offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
+                num_tokens: num_tokens.ok_or_else(|| de::Error::missing_field("num_tokens"))?,
+                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+            }),
+            Some("ChunkRemoved") => Ok(RawKvEvent::ChunkRemoved {
+                chunk_hash: chunk_hash.ok_or_else(|| de::Error::missing_field("chunk_hash"))?,
+                offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
+                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+            }),
+            Some("ChunksCleared") => Ok(RawKvEvent::ChunksCleared {
+                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+            }),
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "ChunkStored",
+                    "ChunkRemoved",
+                    "ChunksCleared",
+                    "Ignored",
+                ],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -276,9 +311,62 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::Ignored)
             }
+            "ChunkStored" => {
+                let chunk_hash: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &"missing chunk_hash"))?;
+                let offset: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &"missing offset"))?;
+                let num_tokens: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &"missing num_tokens"))?;
+                let medium: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(4, &"missing medium"))?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::ChunkStored {
+                    chunk_hash,
+                    offset,
+                    num_tokens,
+                    medium,
+                })
+            }
+            "ChunkRemoved" => {
+                let chunk_hash: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &"missing chunk_hash"))?;
+                let offset: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &"missing offset"))?;
+                let medium: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &"missing medium"))?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::ChunkRemoved {
+                    chunk_hash,
+                    offset,
+                    medium,
+                })
+            }
+            "ChunksCleared" => {
+                let medium: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &"missing medium"))?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawKvEvent::ChunksCleared { medium })
+            }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "Ignored"],
+                &[
+                    "BlockStored",
+                    "BlockRemoved",
+                    "AllBlocksCleared",
+                    "ChunkStored",
+                    "ChunkRemoved",
+                    "ChunksCleared",
+                    "Ignored",
+                ],
             )),
         }
     }

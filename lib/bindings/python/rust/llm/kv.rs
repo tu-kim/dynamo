@@ -2675,6 +2675,29 @@ impl KvRouter {
         })
     }
 
+    /// ComposableKV: dump the PI index as a JSON list of
+    /// {worker_id, dp_rank, medium, chunk_hash, offset, num_tokens}.
+    fn dump_pi_index(&self) -> PyResult<String> {
+        let Some(pi) = self.inner.kv_router().pi_index() else {
+            return Ok("[]".to_string());
+        };
+        let rows: Vec<serde_json::Value> = pi
+            .dump()
+            .into_iter()
+            .map(|(w, d)| {
+                serde_json::json!({
+                    "worker_id": w.worker_id,
+                    "dp_rank": w.dp_rank,
+                    "medium": d.medium.as_wire(),
+                    "chunk_hash": d.chunk_hash,
+                    "offset": d.offset,
+                    "num_tokens": d.num_tokens,
+                })
+            })
+            .collect();
+        serde_json::to_string(&rows).map_err(to_pyerr)
+    }
+
     /// Dump all events from the KV router's indexer as a JSON string
     fn dump_events<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let chooser = Arc::clone(self.inner.kv_router());

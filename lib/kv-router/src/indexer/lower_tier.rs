@@ -554,6 +554,7 @@ impl LowerTierIndexer {
                 self.remove_blocks_impl(worker_blocks, owner, &remove_data.block_hashes)
             }
             KvCacheEventData::Cleared => unreachable!("Cleared returned above"),
+            KvCacheEventData::Chunk(_) => Ok(()), // ComposableKV: PiIndex only
         }
     }
 

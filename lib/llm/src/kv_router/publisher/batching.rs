@@ -102,6 +102,7 @@ fn event_block_count(event: &PlacementEvent) -> usize {
         KvCacheEventData::Stored(data) => data.blocks.len(),
         KvCacheEventData::Removed(data) => data.block_hashes.len(),
         KvCacheEventData::Cleared => 0,
+        KvCacheEventData::Chunk(_) => 0,
     }
 }
 
@@ -215,6 +216,9 @@ impl BatchingState {
             }
             KvCacheEventData::Cleared => {
                 unreachable!("Cleared is handled by the publisher's barrier policy")
+            }
+            KvCacheEventData::Chunk(_) => {
+                unreachable!("Chunk events bypass batching (ComposableKV)")
             }
         };
         event.event_id = self.next_publish_id;

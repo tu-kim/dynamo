@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use dynamo_kv_router::protocols::{KvCacheEvent, KvCacheEventData, StorageTier};
+use dynamo_kv_router::protocols::{ChunkEventKind, KvCacheEvent, KvCacheEventData, StorageTier};
 use futures::{Sink, SinkExt, StreamExt};
 use serde::Serialize;
 use tmq::{
@@ -51,6 +51,20 @@ enum ZmqRawKvEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         medium: Option<&'static str>,
         group_idx: u32,
+    },
+    ChunkStored {
+        chunk_hash: String,
+        offset: u32,
+        num_tokens: u32,
+        medium: &'static str,
+    },
+    ChunkRemoved {
+        chunk_hash: String,
+        offset: u32,
+        medium: &'static str,
+    },
+    ChunksCleared {
+        medium: &'static str,
     },
 }
 
@@ -312,6 +326,22 @@ fn convert_to_zmq_events(
             }]
         }
         KvCacheEventData::Cleared => vec![],
+        KvCacheEventData::Chunk(c) => vec![match c.kind {
+            ChunkEventKind::Stored => ZmqRawKvEvent::ChunkStored {
+                chunk_hash: c.chunk_hash.clone(),
+                offset: c.offset,
+                num_tokens: c.num_tokens,
+                medium: c.medium.as_wire(),
+            },
+            ChunkEventKind::Removed => ZmqRawKvEvent::ChunkRemoved {
+                chunk_hash: c.chunk_hash.clone(),
+                offset: c.offset,
+                medium: c.medium.as_wire(),
+            },
+            ChunkEventKind::Cleared => ZmqRawKvEvent::ChunksCleared {
+                medium: c.medium.as_wire(),
+            },
+        }],
     }
 }
 

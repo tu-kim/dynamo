@@ -80,7 +80,8 @@ impl ReplayEngineObservation for RouterEventObservation {
                     store.blocks.as_slice()
                 }
                 dynamo_kv_router::protocols::KvCacheEventData::Removed(_)
-                | dynamo_kv_router::protocols::KvCacheEventData::Cleared => &[],
+                | dynamo_kv_router::protocols::KvCacheEventData::Cleared
+                | dynamo_kv_router::protocols::KvCacheEventData::Chunk(_) => &[],
             })
             .map(|block| block.tokens_hash.0)
             .collect()
@@ -149,6 +150,8 @@ fn encode_events(
                 }
             }
             KvCacheEventData::Cleared => encoder.begin_kind(2, "cleared"),
+            // ComposableKV chunk events carry no block state for the offline trace.
+            KvCacheEventData::Chunk(_) => encoder.begin_kind(3, "chunk"),
         }
     }
     Ok(())

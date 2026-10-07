@@ -834,6 +834,8 @@ impl<S: AsyncShardHandle> KvIndexerInterface for BranchShardedIndexer<S> {
                     shard.as_ref().apply_event(event.clone()).await;
                 }
             }
+            // ComposableKV chunk events are indexed by PiIndex, never by the trees.
+            KvCacheEventData::Chunk(_) => {}
         }
     }
 

@@ -348,6 +348,9 @@ impl ZmqEventNormalizer {
                 self.cache_namespaces
                     .retain(|(known_worker, _), _| *known_worker != worker);
             }
+            RawKvEvent::ChunkStored { .. }
+            | RawKvEvent::ChunkRemoved { .. }
+            | RawKvEvent::ChunksCleared { .. } => {} // ComposableKV: no block namespaces
             RawKvEvent::Ignored => {}
         }
         Ok(())

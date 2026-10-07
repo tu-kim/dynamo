@@ -124,6 +124,7 @@ pub(super) fn event_plane_event_batches(
                 KvCacheEventData::Stored(data) => data.blocks.len(),
                 KvCacheEventData::Removed(data) => data.block_hashes.len(),
                 KvCacheEventData::Cleared => 0,
+                KvCacheEventData::Chunk(_) => 1,
             };
             if batch_events > 0
                 && (batch_events >= max_events
