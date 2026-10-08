@@ -3317,6 +3317,23 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload
                             )
+                        # ComposableKV: surface the connector's per-request
+                        # result (ckv_result / ckv_build_result) to clients that
+                        # ask for nvext.extra_fields=["engine_data"] (D-OBS).
+                        ckv_params = getattr(res, "kv_transfer_params", None)
+                        if isinstance(ckv_params, dict) and any(
+                            k.startswith("ckv_") for k in ckv_params
+                        ):
+                            engine_data = out.get("engine_data")
+                            engine_data = (
+                                dict(engine_data)
+                                if isinstance(engine_data, dict)
+                                else {}
+                            )
+                            engine_data["kv_transfer_params"] = {
+                                k: v for k, v in ckv_params.items() if k.startswith("ckv_")
+                            }
+                            out["engine_data"] = engine_data
                         # Emit the EFFECTIVE trim offset: clamp the requested
                         # routed_experts_prompt_start to the prompt length. vLLM
                         # clamps the returned routing rows the same way, so an
