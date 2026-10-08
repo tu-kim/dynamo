@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, ChunkEventData, ChunkEventKind, ChunkMedium,
-    ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
-    KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, Placement, PlacementEvent,
-    StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
+    ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
+    KvCacheStoredBlockData, Placement, PlacementEvent, StorageTier, WorkerWithDpRank,
+    compute_block_hash_for_seq,
 };
 
 use super::types::{BlockHashValue, Locality, RawKvEvent};
@@ -200,13 +200,27 @@ fn chunk_event_data(raw: &RawKvEvent) -> Option<ChunkEventData> {
             offset,
             num_tokens,
             medium,
-        } => (ChunkEventKind::Stored, chunk_hash.clone(), *offset, *num_tokens, medium),
+        } => (
+            ChunkEventKind::Stored,
+            chunk_hash.clone(),
+            *offset,
+            *num_tokens,
+            medium,
+        ),
         RawKvEvent::ChunkRemoved {
             chunk_hash,
             offset,
             medium,
-        } => (ChunkEventKind::Removed, chunk_hash.clone(), *offset, 0, medium),
-        RawKvEvent::ChunksCleared { medium } => (ChunkEventKind::Cleared, String::new(), 0, 0, medium),
+        } => (
+            ChunkEventKind::Removed,
+            chunk_hash.clone(),
+            *offset,
+            0,
+            medium,
+        ),
+        RawKvEvent::ChunksCleared { medium } => {
+            (ChunkEventKind::Cleared, String::new(), 0, 0, medium)
+        }
         _ => return None,
     };
     let Some(medium) = ChunkMedium::from_wire(medium) else {

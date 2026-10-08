@@ -353,6 +353,9 @@ pub enum FindBestMatchOutcome {
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         router_hint: Option<RouterHint>,
+        /// ComposableKV plan for the selected worker (D-XFER), if a planner is
+        /// configured and the request has usable PI chunks.
+        composition_plan: Option<dynamo_kv_router::composition::CompositionPlan>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -559,6 +562,8 @@ where
     lora_filter: Option<Arc<crate::lora::LoraFilter>>,
     endpoint_registration: Option<dynamo_runtime::discovery::EndpointRegistrationLease>,
     teardown_task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
+    /// ComposableKV composition planner (SPEC D-PLAN); `None` = plain KV routing.
+    planner: Option<Arc<dyn dynamo_kv_router::composition::CompositionPlanner>>,
 }
 
 fn resolve_tracking_model_name(
@@ -851,9 +856,24 @@ where
             None
         };
 
+        let planner = match kv_router_config.ckv_planner.as_deref() {
+            Some(spec) => {
+                dynamo_kv_router::composition::register_builtin_planners();
+                let planner = dynamo_kv_router::composition::resolve_planner(spec)
+                    .map_err(|e| anyhow::anyhow!("DYN_ROUTER_CKV_PLANNER: {e}"))?;
+                tracing::info!(
+                    planner = planner.name(),
+                    "ComposableKV composition planner enabled"
+                );
+                Some(planner)
+            }
+            None => None,
+        };
+
         tracing::info!("KV Routing initialized");
         let cancellation_token = cancellation_guard.disarm();
         Ok(Self {
+            planner,
             indexer,
             scheduler,
             required_worker_inputs,
@@ -1394,6 +1414,7 @@ where
                 FindBestMatchAdmission::WithAdmission {
                     track_lifecycle: false,
                 },
+                None,
             )
             .await?
         {
@@ -1444,6 +1465,7 @@ where
                 allowed_worker_ids,
                 routing_constraints,
                 FindBestMatchAdmission::WithoutAdmission,
+                None,
             )
             .await?
         {
@@ -1475,6 +1497,7 @@ where
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
         admission: FindBestMatchAdmission,
+        ckv_chunks: Option<&[dynamo_kv_router::composition::ChunkSpan]>,
     ) -> anyhow::Result<FindBestMatchInnerOutcome> {
         let start = Instant::now();
 
@@ -1589,6 +1612,31 @@ where
         // LoRA-aware candidate narrowing: restrict to this LoRA's allocated/loaded replicas,
         // strictly within the existing candidate universe (never widening). Covers both the
         // decode and prefill routers, since both flow through this method.
+        // ComposableKV (D-PLAN): a planner may pin the worker before the
+        // selector runs; an explicit request pin wins. The overlap signals are
+        // kept for the post-selection plan.
+        let pi_index = self.indexer.pi_index();
+        let planner_ctx = match (self.planner.as_ref(), ckv_chunks, pi_index.as_ref()) {
+            (Some(planner), Some(chunks), Some(pi))
+                if !chunks.is_empty() && is_admitted_routing =>
+            {
+                Some((planner, chunks, pi, overlap.clone()))
+            }
+            _ => None,
+        };
+        let pinned_worker = pinned_worker.or_else(|| {
+            let (planner, chunks, pi, overlap) = planner_ctx.as_ref()?;
+            planner.pin_worker(&dynamo_kv_router::composition::PlannerInput {
+                prompt_len: isl_tokens as u32,
+                block_size: self.block_size,
+                link_tokens: dynamo_kv_router::composition::LINK_TOKENS,
+                chunks,
+                overlap,
+                pi,
+                candidate_workers: None,
+            })
+        });
+
         let allowed_worker_ids = self.narrow_allowed_by_lora(
             lora_name.as_deref(),
             allowed_worker_ids,
@@ -1663,6 +1711,42 @@ where
             None
         };
 
+        let composition_plan = planner_ctx
+            .as_ref()
+            .and_then(|(planner, chunks, pi, overlap)| {
+                let input = dynamo_kv_router::composition::PlannerInput {
+                    prompt_len: isl_tokens as u32,
+                    block_size: self.block_size,
+                    link_tokens: dynamo_kv_router::composition::LINK_TOKENS,
+                    chunks,
+                    overlap,
+                    pi,
+                    candidate_workers: None,
+                };
+                let plan =
+                    planner.plan(&input, response.best_worker, response.cached_tokens as u32);
+                // D-OBS: per-request plan summary (predicted hit); the worker logs the actual one.
+                tracing::info!(
+                    request_id = context_id.unwrap_or(""),
+                    worker_id = response.best_worker.worker_id,
+                    dp_rank = response.best_worker.dp_rank,
+                    planner = planner.name(),
+                    chunks = chunks.len(),
+                    prompt_tokens = isl_tokens,
+                    cached_tokens = response.cached_tokens,
+                    plan_prefix = plan.as_ref().map(|p| p.predicted.prefix),
+                    plan_pi = plan.as_ref().map(|p| p.predicted.pi),
+                    plan_pi_segments = plan.as_ref().map(|p| p.predicted.pi_segments),
+                    plan_recompute = plan.as_ref().map(|p| p.predicted.recompute),
+                    chunks_skipped = plan.as_ref().map(|p| p.predicted.chunks_skipped),
+                    "ckv composition plan"
+                );
+                if let Some(m) = metrics::RouterRequestMetrics::get() {
+                    m.observe_ckv_plan(chunks.len(), plan.as_ref());
+                }
+                plan
+            });
+
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);
 
@@ -1713,6 +1797,7 @@ where
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         router_hint,
+                        composition_plan,
                     },
                     attempt,
                 }),

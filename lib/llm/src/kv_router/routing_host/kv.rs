@@ -485,6 +485,18 @@ where
                 "Failed to attach router_hint to backend request"
             );
         }
+        // ComposableKV D-XFER-1: the router's plan replaces any caller-supplied one.
+        backend_input.remove_composition_plan();
+        if let Some(plan) = selection.composition_plan.as_ref()
+            && let Err(error) = backend_input.attach_composition_plan(plan)
+        {
+            tracing::warn!(
+                request_id = %context_id,
+                worker_id = selection.worker.worker_id,
+                error = %error,
+                "Failed to attach composition_plan to backend request"
+            );
+        }
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
 

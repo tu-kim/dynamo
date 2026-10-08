@@ -180,15 +180,21 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 chunk_hash: chunk_hash.ok_or_else(|| de::Error::missing_field("chunk_hash"))?,
                 offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
                 num_tokens: num_tokens.ok_or_else(|| de::Error::missing_field("num_tokens"))?,
-                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+                medium: medium
+                    .flatten()
+                    .ok_or_else(|| de::Error::missing_field("medium"))?,
             }),
             Some("ChunkRemoved") => Ok(RawKvEvent::ChunkRemoved {
                 chunk_hash: chunk_hash.ok_or_else(|| de::Error::missing_field("chunk_hash"))?,
                 offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
-                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+                medium: medium
+                    .flatten()
+                    .ok_or_else(|| de::Error::missing_field("medium"))?,
             }),
             Some("ChunksCleared") => Ok(RawKvEvent::ChunksCleared {
-                medium: medium.flatten().ok_or_else(|| de::Error::missing_field("medium"))?,
+                medium: medium
+                    .flatten()
+                    .ok_or_else(|| de::Error::missing_field("medium"))?,
             }),
             Some(other) => Err(de::Error::unknown_variant(
                 other,

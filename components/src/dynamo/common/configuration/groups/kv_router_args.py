@@ -53,6 +53,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_policy_config",
     "router_prefill_policy",
     "router_decode_policy",
+    "ckv_planner",
     "router_event_threads",
     "router_queue_policy",
     "use_remote_indexer",
@@ -214,6 +215,7 @@ class KvRouterConfigBase(ConfigBase):
     router_policy_config: Optional[str] = None
     router_prefill_policy: Optional[str] = None
     router_decode_policy: Optional[str] = None
+    ckv_planner: Optional[str] = None
     router_event_threads: int
     router_queue_policy: str
     use_remote_indexer: bool = False
@@ -618,6 +620,18 @@ class KvRouterArgGroup(ArgGroup):
                 "workers in this router process. "
                 "Overrides worker_selection.decode from --router-policy-config. "
                 "Use 'default' for Dynamo's built-in worker selector."
+            ),
+            arg_type=str,
+        )
+        add_argument(
+            g,
+            flag_name="--ckv-planner",
+            env_var="DYN_ROUTER_CKV_PLANNER",
+            default=None,
+            help=(
+                "ComposableKV: composition planner for PI-KV reuse ('ckv-stub', "
+                "'ckv-pin-worker:<worker_id>[.<dp_rank>]', or a plugin name). "
+                "Unset keeps plain KV routing."
             ),
             arg_type=str,
         )

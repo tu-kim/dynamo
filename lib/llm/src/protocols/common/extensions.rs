@@ -250,6 +250,31 @@ pub struct NvExt {
     #[builder(default, setter(strip_option))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterParams>,
+
+    /// ComposableKV extension (SPEC §6.6 O-META / builder requests).
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ckv: Option<CkvExt>,
+}
+
+/// ComposableKV request extension.
+///
+/// `files` lists the `read` tool results in the conversation whose text is a
+/// PI-KV chunk; the preprocessor finds their token spans (D-SEG). `build`, when
+/// present, is forwarded verbatim as `kv_transfer_params.ckv_build` so the
+/// ckv-builder can run PI-KV builds through the frontend.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct CkvExt {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<CkvFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CkvFile {
+    pub tool_call_id: String,
+    pub path: String,
 }
 
 impl Default for NvExt {
@@ -291,6 +316,7 @@ impl NvExt {
             request_timestamp_ms,
             routing_constraints,
             router,
+            ckv,
         } = self;
 
         greed_sampling.is_some()
@@ -309,6 +335,7 @@ impl NvExt {
             || request_timestamp_ms.is_some()
             || routing_constraints.is_some()
             || router.is_some()
+            || ckv.is_some()
     }
 }
 

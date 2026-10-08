@@ -108,7 +108,12 @@ impl PiIndex {
     }
 
     /// Chunks held by one rank on one medium (any offset), for planning.
-    pub fn entries(&self, worker_id: WorkerId, dp_rank: DpRank, medium: ChunkMedium) -> Vec<(PiKey, u32)> {
+    pub fn entries(
+        &self,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        medium: ChunkMedium,
+    ) -> Vec<(PiKey, u32)> {
         let inner = self.inner.lock().unwrap();
         inner
             .get(&(WorkerWithDpRank { worker_id, dp_rank }, medium))
@@ -143,13 +148,20 @@ impl PiIndex {
             })
             .collect();
         out.sort_by(|a, b| {
-            (a.0.worker_id, a.0.dp_rank, a.1.medium as u8, &a.1.chunk_hash, a.1.offset).cmp(&(
-                b.0.worker_id,
-                b.0.dp_rank,
-                b.1.medium as u8,
-                &b.1.chunk_hash,
-                b.1.offset,
-            ))
+            (
+                a.0.worker_id,
+                a.0.dp_rank,
+                a.1.medium as u8,
+                &a.1.chunk_hash,
+                a.1.offset,
+            )
+                .cmp(&(
+                    b.0.worker_id,
+                    b.0.dp_rank,
+                    b.1.medium as u8,
+                    &b.1.chunk_hash,
+                    b.1.offset,
+                ))
         });
         out
     }
@@ -187,16 +199,28 @@ mod tests {
     #[test]
     fn t5_3_stored_then_removed_follows_event_order() {
         let idx = PiIndex::new();
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu));
-        idx.apply(w(2, 0), &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu));
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Stored, "a", 0, ChunkMedium::Dram));
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu),
+        );
+        idx.apply(
+            w(2, 0),
+            &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu),
+        );
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Stored, "a", 0, ChunkMedium::Dram),
+        );
         let holders = idx.holders("a", 32);
         assert_eq!(holders.len(), 2);
         assert_eq!(holders[0].worker_id, 1);
         assert_eq!(holders[0].medium, ChunkMedium::Gpu);
         assert_eq!(idx.holders("a", 0)[0].medium, ChunkMedium::Dram);
 
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Removed, "a", 32, ChunkMedium::Gpu));
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Removed, "a", 32, ChunkMedium::Gpu),
+        );
         let holders = idx.holders("a", 32);
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].worker_id, 2);
@@ -204,21 +228,45 @@ mod tests {
         assert_eq!(idx.holders("a", 0).len(), 1);
         assert_eq!(idx.len(), 2);
         // Removing something unknown is a no-op.
-        idx.apply(w(9, 0), &ev(ChunkEventKind::Removed, "zzz", 0, ChunkMedium::Gpu));
+        idx.apply(
+            w(9, 0),
+            &ev(ChunkEventKind::Removed, "zzz", 0, ChunkMedium::Gpu),
+        );
         assert_eq!(idx.len(), 2);
     }
 
     #[test]
     fn t5_4_cleared_and_worker_removal_only_touch_that_rank() {
         let idx = PiIndex::new();
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu));
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Stored, "a", 0, ChunkMedium::Dram));
-        idx.apply(w(1, 1), &ev(ChunkEventKind::Stored, "b", 32, ChunkMedium::Gpu));
-        idx.apply(w(2, 0), &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu));
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu),
+        );
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Stored, "a", 0, ChunkMedium::Dram),
+        );
+        idx.apply(
+            w(1, 1),
+            &ev(ChunkEventKind::Stored, "b", 32, ChunkMedium::Gpu),
+        );
+        idx.apply(
+            w(2, 0),
+            &ev(ChunkEventKind::Stored, "a", 32, ChunkMedium::Gpu),
+        );
 
         // ChunksCleared(GPU) from rank (1,0): its GPU entries go, DRAM and other ranks stay.
-        idx.apply(w(1, 0), &ev(ChunkEventKind::Cleared, "", 0, ChunkMedium::Gpu));
-        assert_eq!(idx.holders("a", 32).iter().map(|h| h.worker_id).collect::<Vec<_>>(), vec![2]);
+        idx.apply(
+            w(1, 0),
+            &ev(ChunkEventKind::Cleared, "", 0, ChunkMedium::Gpu),
+        );
+        assert_eq!(
+            idx.holders("a", 32)
+                .iter()
+                .map(|h| h.worker_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
         assert_eq!(idx.holders("a", 0).len(), 1);
         assert_eq!(idx.holders("b", 32).len(), 1);
 

@@ -145,6 +145,10 @@ _KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY: Final = "kv_transfer_params"
 # Request payload key under extra_args.kv_transfer_params. This intentionally
 # matches the runtime capability string, but it lives in a different namespace.
 _ROUTER_HINT_EXTRA_ARGS_KEY: Final = "router_hint"
+# ComposableKV: keys the Dynamo frontend/router adds for the CkvConnector
+# (D-XFER-2). ``composition_plan`` is router-generated; ``ckv_build`` comes from
+# ``nvext.ckv.build`` (the ckv-builder's requests through the frontend).
+_CKV_EXTRA_ARGS_KEYS: Final = ("composition_plan", "ckv_build")
 _DISTRIBUTED_WEIGHT_UPDATE_RESERVED_KEYS: Final = frozenset(
     {
         "allow_unpaused",
@@ -869,10 +873,17 @@ def build_sampling_params(
     if isinstance(extra_args, dict):
         request_kv_transfer_params = extra_args.get(_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY)
         if isinstance(request_kv_transfer_params, dict):
+            passthrough: dict = {}
             passthrough_router_hint = request_kv_transfer_params.get(
                 _ROUTER_HINT_EXTRA_ARGS_KEY
             )
             if isinstance(passthrough_router_hint, dict):
+                passthrough[_ROUTER_HINT_EXTRA_ARGS_KEY] = passthrough_router_hint
+            for key in _CKV_EXTRA_ARGS_KEYS:
+                value = request_kv_transfer_params.get(key)
+                if isinstance(value, dict):
+                    passthrough[key] = value
+            if passthrough:
                 passthrough_extra_args = (
                     dict(sampling_params.extra_args)
                     if isinstance(sampling_params.extra_args, dict)
@@ -886,9 +897,7 @@ def build_sampling_params(
                     if isinstance(existing_kv_transfer_params, dict)
                     else {}
                 )
-                passthrough_kv_transfer_params[
-                    _ROUTER_HINT_EXTRA_ARGS_KEY
-                ] = passthrough_router_hint
+                passthrough_kv_transfer_params.update(passthrough)
                 passthrough_extra_args[
                     _KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY
                 ] = passthrough_kv_transfer_params
@@ -937,6 +946,12 @@ def _update_kv_transfer_params(
     )
     if isinstance(router_hint, Mapping):
         updated_params[_ROUTER_HINT_EXTRA_ARGS_KEY] = router_hint
+    # ComposableKV keys ride along with the router hint (prefill-side plan).
+    if preserve_router_hint and isinstance(existing_params, Mapping):
+        for key in _CKV_EXTRA_ARGS_KEYS:
+            value = existing_params.get(key)
+            if isinstance(value, Mapping):
+                updated_params[key] = value
 
     extra_args[_KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY] = updated_params
     sampling_params.extra_args = extra_args

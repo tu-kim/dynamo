@@ -2576,6 +2576,58 @@ impl OpenAIPreprocessor {
         self.tokenizer.encode(s)
     }
 
+    /// ComposableKV: D-SEG chunk spans from `nvext.ckv.files` (frontend-only
+    /// field) and `nvext.ckv.build` → `extra_args.kv_transfer_params.ckv_build`.
+    fn apply_ckv_ext<R: OAIChatLikeRequest + NvExtProvider>(
+        &self,
+        request: &R,
+        preprocessed: &mut PreprocessedRequest,
+    ) -> Result<()> {
+        let Some(ckv) = request.nvext().and_then(|n| n.ckv.as_ref()) else {
+            return Ok(());
+        };
+        if !ckv.files.is_empty() {
+            let messages = request.typed_messages().unwrap_or(&[]);
+            let model_id = crate::ckv_segment::model_id_for(&preprocessed.model);
+            let spans = crate::ckv_segment::locate_chunks(
+                &model_id,
+                &ckv.files,
+                messages,
+                &preprocessed.token_ids,
+                |text| {
+                    let segment = crate::tokenizers::EncodeSegment::new(text, false);
+                    Ok(self
+                        .tokenizer
+                        .encode_segments(&[segment])?
+                        .token_ids()
+                        .to_vec())
+                },
+            );
+            tracing::debug!(
+                files = ckv.files.len(),
+                chunks = spans.len(),
+                "ckv: chunk spans located"
+            );
+            preprocessed.ckv_chunks = Some(spans);
+        }
+        if let Some(build) = &ckv.build {
+            let extra_args = preprocessed
+                .extra_args
+                .get_or_insert_with(|| serde_json::json!({}));
+            let extra_args = extra_args
+                .as_object_mut()
+                .context("preprocessed extra_args must be an object")?;
+            let params = extra_args
+                .entry("kv_transfer_params")
+                .or_insert_with(|| serde_json::json!({}));
+            let params = params
+                .as_object_mut()
+                .context("extra_args.kv_transfer_params must be an object")?;
+            params.insert("ckv_build".to_string(), build.clone());
+        }
+        Ok(())
+    }
+
     /// Encode a rendered prompt while preserving model-specific special-token
     /// boundaries.
     pub fn tokenize_rendered_prompt(&self, prompt: &RenderedPrompt) -> anyhow::Result<Encoding> {
@@ -2694,6 +2746,7 @@ impl OpenAIPreprocessor {
         }
 
         let mut preprocessed = builder.build()?;
+        self.apply_ckv_ext(request, &mut preprocessed)?;
         if let Some(reasoning_ended) = Self::prompt_injected_reasoning_ended_arg(
             self.runtime_config.reasoning_parser.as_deref(),
             formatted_prompt.as_ref().map(RenderedPrompt::as_str),

@@ -859,6 +859,14 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .await;
 
         let prompt_tokens_count = request.token_ids.len();
+        // ComposableKV T6-7: echo what the router attached so a test client
+        // (nvext.extra_fields=["engine_data"]) can compare it with the plan.
+        let ckv_echo: Option<serde_json::Value> = request
+            .extra_args
+            .as_ref()
+            .and_then(|a| a.get("kv_transfer_params"))
+            .cloned()
+            .map(|params| serde_json::json!({ "kv_transfer_params": params }));
         // Convert PreprocessedRequest to DirectRequest for scheduler
         let direct_request = DirectRequest {
             tokens: request.token_ids.clone(),
@@ -1131,6 +1139,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                             completion_usage: signal.cached_tokens.map(|cached| {
                                 usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
                             }),
+                            engine_data: (token_count == 1).then(|| ckv_echo.clone()).flatten(),
                             ..Default::default()
                         };
 

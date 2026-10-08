@@ -599,9 +599,14 @@ impl LocalKvIndexer {
                 tokio::time::sleep(delay).await;
             }
 
-            let build_output =
-                Self::build_fresh_dump(indexer, lower_tier_indexers, pi, event_buffer, last_event_id)
-                    .await;
+            let build_output = Self::build_fresh_dump(
+                indexer,
+                lower_tier_indexers,
+                pi,
+                event_buffer,
+                last_event_id,
+            )
+            .await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
 

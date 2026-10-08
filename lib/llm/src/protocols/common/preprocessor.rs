@@ -14,6 +14,7 @@ use dynamo_runtime::error::{DynamoError, ErrorType, match_error_chain};
 use serde::{Deserialize, Serialize};
 
 const KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY: &str = "kv_transfer_params";
+const COMPOSITION_PLAN_EXTRA_ARGS_KEY: &str = "composition_plan";
 use uuid::Uuid;
 
 use super::extensions::{AgentContext, RouterParams};
@@ -268,6 +269,13 @@ pub struct PreprocessedRequest {
     #[serde(skip)]
     pub(crate) staged_kv_cleanup: bool,
 
+    /// ComposableKV PI chunk spans located in `token_ids` by the preprocessor
+    /// (SPEC D-SEG). Frontend-only: the router plans from it, the worker gets
+    /// the plan in `extra_args.kv_transfer_params.composition_plan`.
+    #[builder(default)]
+    #[serde(skip)]
+    pub ckv_chunks: Option<Vec<dynamo_kv_router::composition::ChunkSpan>>,
+
     /// Type of prompt
     pub token_ids: Vec<TokenIdType>,
 
@@ -489,6 +497,37 @@ impl PreprocessedRequest {
         );
         self.extra_args = Some(serde_json::Value::Object(map));
         Ok(())
+    }
+
+    /// ComposableKV D-XFER-1: `extra_args.kv_transfer_params.composition_plan`.
+    pub fn attach_composition_plan(
+        &mut self,
+        plan: &dynamo_kv_router::composition::CompositionPlan,
+    ) -> serde_json::Result<()> {
+        let value = serde_json::to_value(plan)?;
+        let mut map = extra_args_object(self.extra_args.take());
+        let mut kv_transfer_params = match map.remove(KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY) {
+            Some(serde_json::Value::Object(params)) => params,
+            Some(_) | None => serde_json::Map::new(),
+        };
+        kv_transfer_params.insert(COMPOSITION_PLAN_EXTRA_ARGS_KEY.to_string(), value);
+        map.insert(
+            KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY.to_string(),
+            serde_json::Value::Object(kv_transfer_params),
+        );
+        self.extra_args = Some(serde_json::Value::Object(map));
+        Ok(())
+    }
+
+    /// Drop a caller-supplied `composition_plan` (only the router may set one).
+    pub fn remove_composition_plan(&mut self) {
+        let _ = self
+            .extra_args
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|args| args.get_mut(KV_TRANSFER_PARAMS_EXTRA_ARGS_KEY))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.remove(COMPOSITION_PLAN_EXTRA_ARGS_KEY));
     }
 
     /// Extract the token IDs and optional block MM info used for KV cache overlap computation.

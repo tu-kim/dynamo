@@ -1556,13 +1556,20 @@ fn t5_1_chunk_events_decode_from_map_and_sequence_forms() {
     })
     .unwrap();
     let ev: RawKvEvent = from_slice(&stored).unwrap();
-    assert!(matches!(
-        &ev,
-        RawKvEvent::ChunkStored { chunk_hash, offset: 32, num_tokens: 1392, medium }
-            if chunk_hash == "8ad48c2262a60db71e45cca2aa0821e5" && medium == "GPU"
-    ), "{ev:?}");
+    assert!(
+        matches!(
+            &ev,
+            RawKvEvent::ChunkStored { chunk_hash, offset: 32, num_tokens: 1392, medium }
+                if chunk_hash == "8ad48c2262a60db71e45cca2aa0821e5" && medium == "GPU"
+        ),
+        "{ev:?}"
+    );
     assert!(ev.is_chunk());
-    assert_eq!(ev.medium(), None, "chunk media must not hit the block-tier gate");
+    assert_eq!(
+        ev.medium(),
+        None,
+        "chunk media must not hit the block-tier gate"
+    );
 
     let cleared = to_vec_named(&MapChunksClearedFixture {
         event_type: "ChunksCleared",
@@ -1570,16 +1577,22 @@ fn t5_1_chunk_events_decode_from_map_and_sequence_forms() {
     })
     .unwrap();
     let ev: RawKvEvent = from_slice(&cleared).unwrap();
-    assert!(matches!(&ev, RawKvEvent::ChunksCleared { medium } if medium == "GPU"), "{ev:?}");
+    assert!(
+        matches!(&ev, RawKvEvent::ChunksCleared { medium } if medium == "GPU"),
+        "{ev:?}"
+    );
 
     // array_like form: [tag, chunk_hash, offset, medium]
     let removed = to_vec(&("ChunkRemoved", "abcd", 0u32, "DRAM")).unwrap();
     let ev: RawKvEvent = from_slice(&removed).unwrap();
-    assert!(matches!(
-        &ev,
-        RawKvEvent::ChunkRemoved { chunk_hash, offset: 0, medium }
-            if chunk_hash == "abcd" && medium == "DRAM"
-    ), "{ev:?}");
+    assert!(
+        matches!(
+            &ev,
+            RawKvEvent::ChunkRemoved { chunk_hash, offset: 0, medium }
+                if chunk_hash == "abcd" && medium == "DRAM"
+        ),
+        "{ev:?}"
+    );
 }
 
 #[test]

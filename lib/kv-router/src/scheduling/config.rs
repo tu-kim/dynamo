@@ -33,6 +33,7 @@ pub const DYN_ROUTER_WORKER_SELECTION_POLICY: &str = "DYN_ROUTER_WORKER_SELECTIO
 
 /// Selects a configured custom worker-selection policy instance for prefill workers.
 pub const DYN_ROUTER_PREFILL_POLICY: &str = "DYN_ROUTER_PREFILL_POLICY";
+pub const DYN_ROUTER_CKV_PLANNER: &str = "DYN_ROUTER_CKV_PLANNER";
 
 /// Selects a configured custom worker-selection policy instance for decode workers.
 pub const DYN_ROUTER_DECODE_POLICY: &str = "DYN_ROUTER_DECODE_POLICY";
@@ -296,6 +297,9 @@ fn kv_router_config_from_lookup(
     }
     if let Some(value) = get_env(DYN_ROUTER_DECODE_POLICY) {
         config.router_decode_policy = Some(value);
+    }
+    if let Some(value) = get_env(DYN_ROUTER_CKV_PLANNER) {
+        config.ckv_planner = Some(value).filter(|v| !v.trim().is_empty());
     }
     if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_CONDITIONAL_DISAGG") {
         config.conditional_disagg_enabled = value;
@@ -847,6 +851,12 @@ pub struct KvRouterConfig {
     #[serde(skip)]
     pub router_decode_policy: Option<String>,
 
+    /// ComposableKV composition planner spec (`ckv-stub`, `ckv-pin-worker:<id>`, or a
+    /// plugin name). `None` keeps the plain KV router (SPEC D-PLAN-3). Process-local,
+    /// set from `DYN_ROUTER_CKV_PLANNER`.
+    #[serde(skip)]
+    pub ckv_planner: Option<String>,
+
     /// Run-level model selector used by offline and online replay.
     #[serde(skip)]
     #[doc(hidden)]
@@ -974,6 +984,7 @@ impl Default for KvRouterConfig {
             router_policy_config: None,
             router_prefill_policy: None,
             router_decode_policy: None,
+            ckv_planner: None,
             policy_model_name: None,
             policy_config_cache: OnceLock::new(),
             router_event_threads: 4,
@@ -1038,6 +1049,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_policy_config: compat.router_policy_config,
             router_prefill_policy: None,
             router_decode_policy: None,
+            ckv_planner: None,
             policy_model_name: None,
             policy_config_cache: OnceLock::new(),
             router_event_threads: compat.router_event_threads,

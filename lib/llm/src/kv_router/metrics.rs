@@ -854,6 +854,12 @@ pub struct RouterRequestMetrics {
     pub shared_cache_beyond_blocks: prometheus::Histogram,
     pub non_max_overlap_selections_total: IntCounterVec,
     pub overlap_blocks_lost: HistogramVec,
+    /// ComposableKV D-OBS: PI tokens the router planned per request.
+    pub ckv_plan_pi_tokens: prometheus::Histogram,
+    /// ComposableKV D-OBS: chunks found in requests, by planning outcome
+    /// (`planned` = in the plan, `skipped` = no holder / inside the prefix,
+    /// `no_plan` = request got no plan).
+    pub ckv_plan_chunks_total: IntCounterVec,
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -989,7 +995,25 @@ impl RouterRequestMetrics {
                     .expect("failed to create router_overlap_blocks_lost");
                 non_max_overlap_selections_total.with_label_values(&[WORKER_TYPE_PREFILL]);
                 overlap_blocks_lost.with_label_values(&[WORKER_TYPE_PREFILL]);
+                let ckv_plan_pi_tokens = metrics
+                    .create_histogram(
+                        &router_metric("ckv_plan_pi_tokens"),
+                        "ComposableKV: PI-KV tokens the router planned for reuse per request",
+                        extra_labels,
+                        Some(prometheus::exponential_buckets(16.0, 2.0, 14).unwrap()),
+                    )
+                    .expect("failed to create router_ckv_plan_pi_tokens");
+                let ckv_plan_chunks_total = metrics
+                    .create_intcountervec(
+                        &router_metric("ckv_plan_chunks_total"),
+                        "ComposableKV: PI chunks found in requests by planning outcome",
+                        &["outcome"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_ckv_plan_chunks_total");
                 Arc::new(Self {
+                    ckv_plan_pi_tokens,
+                    ckv_plan_chunks_total,
                     requests_total,
                     time_to_first_token_seconds,
                     inter_token_latency_seconds,
@@ -1004,6 +1028,30 @@ impl RouterRequestMetrics {
                 })
             })
             .clone()
+    }
+
+    /// ComposableKV D-OBS: record a planning outcome for one request.
+    pub fn observe_ckv_plan(
+        &self,
+        chunks_found: usize,
+        plan: Option<&dynamo_kv_router::composition::CompositionPlan>,
+    ) {
+        match plan {
+            Some(plan) => {
+                self.ckv_plan_pi_tokens.observe(plan.predicted.pi as f64);
+                let skipped = plan.predicted.chunks_skipped as u64;
+                self.ckv_plan_chunks_total
+                    .with_label_values(&["planned"])
+                    .inc_by((chunks_found as u64).saturating_sub(skipped));
+                self.ckv_plan_chunks_total
+                    .with_label_values(&["skipped"])
+                    .inc_by(skipped);
+            }
+            None => self
+                .ckv_plan_chunks_total
+                .with_label_values(&["no_plan"])
+                .inc_by(chunks_found as u64),
+        }
     }
 
     /// Record a selection that sacrificed KV cache overlap.

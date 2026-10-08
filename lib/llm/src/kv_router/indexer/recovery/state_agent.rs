@@ -1860,6 +1860,7 @@ mod tests {
                 lower_tier: LowerTierIndexers::new(1, 4),
                 approx: None,
                 primary_records_routing_decisions: false,
+                pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
             },
         )
     }
@@ -2096,6 +2097,7 @@ mod tests {
             lower_tier: lower_tiers.clone(),
             approx: None,
             primary_records_routing_decisions: false,
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         };
         lower_tiers
             .get_or_create(StorageTier::HostPinned)

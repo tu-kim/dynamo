@@ -39,6 +39,7 @@ pub(super) struct WorkerSelection {
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) router_hint: Option<RouterHint>,
+    pub(super) composition_plan: Option<dynamo_kv_router::composition::CompositionPlan>,
 }
 
 pub(super) enum SelectionOutcome {
@@ -59,6 +60,8 @@ impl SelectionOutcome {
 pub(super) struct RoutingRequestParts<'a> {
     pub(super) token_ids: &'a [TokenIdType],
     pub(super) block_mm_infos: Option<&'a [Option<BlockExtraInfo>]>,
+    /// ComposableKV PI chunk spans found by the preprocessor (D-SEG).
+    pub(super) ckv_chunks: Option<&'a [dynamo_kv_router::composition::ChunkSpan]>,
 }
 
 impl<'a> RoutingRequestParts<'a> {
@@ -67,6 +70,7 @@ impl<'a> RoutingRequestParts<'a> {
         Self {
             token_ids,
             block_mm_infos,
+            ckv_chunks: request.ckv_chunks.as_deref(),
         }
     }
 }
@@ -126,6 +130,7 @@ where
                 args.allowed_worker_ids,
                 args.routing_constraints,
                 args.admission,
+                args.routing_parts.ckv_chunks,
             )
             .await?;
         match outcome {
@@ -138,6 +143,7 @@ where
                     potential_decode_blocks,
                     routing_hashes,
                     router_hint,
+                    composition_plan,
                 } => Ok(SelectionOutcome::Routed(WorkerSelection {
                     worker,
                     attempt: admitted.attempt,
@@ -148,6 +154,7 @@ where
                     selected_worker_load: None,
                     routing_hashes,
                     router_hint,
+                    composition_plan,
                 })),
                 FindBestMatchOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))
@@ -172,6 +179,7 @@ where
                     selected_worker_load: Some(selected_worker_load),
                     routing_hashes,
                     router_hint: None,
+                    composition_plan: None,
                 })),
                 crate::kv_router::FindBestMatchAdvisoryOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))

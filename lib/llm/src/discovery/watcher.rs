@@ -1278,6 +1278,7 @@ fn effective_router_config<'a>(
         .kv_router_config
         .router_decode_policy
         .clone();
+    effective.kv_router_config.ckv_planner = frontend_config.kv_router_config.ckv_planner.clone();
     effective.session_affinity_mode = frontend_config.session_affinity_mode;
     Cow::Owned(effective)
 }

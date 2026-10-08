@@ -39,9 +39,9 @@ pub use self::embedding_cache::{
 };
 pub(crate) use self::recording::ApproximateRequestLease;
 use self::remote::RemoteIndexer;
-pub use dynamo_kv_router::indexer::PiIndex;
 pub use self::remote::{ServedIndexerHandle, ServedIndexerMode, ensure_served_indexer_service};
 pub use self::side::SideIndexer;
+pub use dynamo_kv_router::indexer::PiIndex;
 #[cfg(feature = "ckf-diagnostics")]
 pub(crate) use recovery::WorkerQueryHealthSnapshot;
 pub(crate) use recovery::{
@@ -226,7 +226,7 @@ impl Indexer {
                 primary: Arc::new(remote),
                 approx,
                 primary_records_routing_decisions: !kv_router_config.use_kv_events,
-                pi: Arc::new(PiIndex::new()),
+                pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
             });
         }
 
@@ -263,7 +263,7 @@ impl Indexer {
                     ),
                     approx: None,
                     primary_records_routing_decisions: true,
-                    pi: Arc::new(PiIndex::new()),
+                    pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
                 });
             }
 
@@ -281,7 +281,7 @@ impl Indexer {
                 ),
                 approx: None,
                 primary_records_routing_decisions: true,
-                pi: Arc::new(PiIndex::new()),
+                pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
             });
         }
 
@@ -308,7 +308,7 @@ impl Indexer {
                 ),
                 approx,
                 primary_records_routing_decisions: false,
-                pi: Arc::new(PiIndex::new()),
+                pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
             });
         }
 
@@ -327,7 +327,7 @@ impl Indexer {
             ),
             approx,
             primary_records_routing_decisions: false,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         })
     }
 
@@ -634,7 +634,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(1, 4),
             approx: None,
             primary_records_routing_decisions: false,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         }
     }
 
@@ -648,7 +648,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: false,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         }
     }
 
@@ -665,7 +665,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: true,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         }
     }
 
@@ -1074,7 +1074,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         };
         assert!(indexer.records_routing_decisions());
 
@@ -1206,7 +1206,7 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
-            pi: Arc::new(PiIndex::new()),
+            pi: Arc::new(dynamo_kv_router::indexer::PiIndex::new()),
         };
 
         let primary_worker = WorkerWithDpRank::new(10, 0);

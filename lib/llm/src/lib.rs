@@ -7,6 +7,7 @@
 //! distributed LLM inference solutions.
 
 pub mod backend;
+pub mod ckv_segment;
 pub mod common;
 mod direct_zmq_fan_in;
 pub mod discovery;
