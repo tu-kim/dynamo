@@ -77,9 +77,42 @@ fn tool_message_text<'a>(
     })
 }
 
+/// Where a chunk's standalone tokens sit in the prompt, allowing for BPE
+/// merges at both boundaries: the first and last standalone tokens may fuse
+/// with the surrounding template text (e.g. Qwen3 merges the closing `>` with
+/// the newline before `</tool_response>`). The interior must match exactly.
+///
+/// Returns `(start, usable_len)`: `start` is the position of the chunk's first
+/// token (possibly a merged token; it lies inside the link recompute, so its
+/// KV is never taken from the chunk), and `usable_len` excludes the last
+/// token when it did not match, so no PI block covers it.
+pub fn locate_span(token_ids: &[u32], chunk: &[u32], from: usize) -> Option<(usize, usize)> {
+    if chunk.len() < 3 {
+        return find_subsequence(token_ids, chunk, from).map(|p| (p, chunk.len()));
+    }
+    if let Some(p) = find_subsequence(token_ids, chunk, from) {
+        return Some((p, chunk.len()));
+    }
+    let interior = &chunk[1..chunk.len() - 1];
+    let p = find_subsequence(token_ids, interior, from.saturating_add(1))?;
+    let start = p - 1;
+    let last_pos = p + interior.len();
+    let last_matches = token_ids.get(last_pos) == Some(&chunk[chunk.len() - 1]);
+    Some((
+        start,
+        if last_matches {
+            chunk.len()
+        } else {
+            chunk.len() - 1
+        },
+    ))
+}
+
 /// Locate every listed file's chunk in `token_ids`. Files are searched in the
 /// given order, each from the end of the previous match (conversation order),
 /// falling back to a search from the start. Returns spans sorted by start.
+/// `ChunkSpan::len` is the usable length (see [`locate_span`]); the hash is
+/// always over the full standalone token sequence, as the builder computes it.
 pub fn locate_chunks<E>(
     model_id: &str,
     files: &[CkvFile],
@@ -107,17 +140,18 @@ where
         if ids.is_empty() {
             continue;
         }
-        let found = find_subsequence(token_ids, &ids, cursor)
-            .or_else(|| find_subsequence(token_ids, &ids, 0));
+        let found =
+            locate_span(token_ids, &ids, cursor).or_else(|| locate_span(token_ids, &ids, 0));
         match found {
-            Some(start) => {
+            Some((start, usable)) => {
                 let hash = chunk_hash(model_id, &ids);
-                tracing::debug!(path = %file.path, chunk_hash = %hash, start, len = ids.len(), "ckv: chunk located");
-                cursor = start + ids.len();
+                tracing::debug!(path = %file.path, chunk_hash = %hash, start, len = ids.len(), usable,
+                    "ckv: chunk located");
+                cursor = start + usable;
                 spans.push(ChunkSpan {
                     chunk_hash: hash,
                     start: start as u32,
-                    len: ids.len() as u32,
+                    len: usable as u32,
                 });
             }
             None => {
@@ -207,8 +241,11 @@ mod tests {
     fn t6_3_chunk_whose_context_tokens_differ_is_excluded() {
         let a = "<path>/r/a.py</path>\nAAAA";
         let b = "<path>/r/b.py</path>\nBBBB";
-        // the prompt contains a mangled copy of b (merged boundary token)
-        let prompt = format!("<tool>{a}</tool><tool>{}</tool>", b.replace("\nB", "~B"));
+        // the prompt contains a mangled copy of b (an interior token differs)
+        let prompt = format!(
+            "<tool>{a}</tool><tool>{}</tool>",
+            b.replace("</path>", "</pth>")
+        );
         let ids = enc(&prompt).unwrap();
         let msgs = vec![tool("c1", a), tool("c2", b)];
         let spans = locate_chunks(
@@ -220,6 +257,37 @@ mod tests {
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].chunk_hash, chunk_hash("m", &enc(a).unwrap()));
+    }
+
+    /// Qwen3 merges the chunk's closing `>` with the template newline: the
+    /// interior still matches, the span excludes the fused last token, and the
+    /// hash stays the standalone one (what the builder stored).
+    #[test]
+    fn t6_3_boundary_merge_keeps_chunk_without_its_last_token() {
+        let a = "<path>/r/a.py</path>\nAAAA</content>";
+        let mut ids = enc(a).unwrap();
+        let standalone = ids.clone();
+        let prompt_prefix = enc("<tool>\n").unwrap();
+        let last = ids.pop().unwrap();
+        let mut prompt = prompt_prefix.clone();
+        prompt.extend(&ids);
+        prompt.push(last + 1000); // fused ">\n" token: different id
+        prompt.extend(enc("</tool>").unwrap());
+        let msgs = vec![tool("c1", a)];
+        let spans = locate_chunks("m", &[file("c1", "/r/a.py")], &msgs, &prompt, enc);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start as usize, prompt_prefix.len());
+        assert_eq!(spans[0].len as usize, standalone.len() - 1);
+        assert_eq!(spans[0].chunk_hash, chunk_hash("m", &standalone));
+        // a fused *first* token is tolerated too (it lies inside the link recompute)
+        let mut prompt2 = prompt_prefix.clone();
+        prompt2.push(standalone[0] + 1000);
+        prompt2.extend(&standalone[1..]);
+        let spans = locate_chunks("m", &[file("c1", "/r/a.py")], &msgs, &prompt2, enc);
+        assert_eq!(
+            (spans[0].start as usize, spans[0].len as usize),
+            (prompt_prefix.len(), standalone.len())
+        );
     }
 
     #[test]
