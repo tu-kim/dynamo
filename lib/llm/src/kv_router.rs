@@ -52,6 +52,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod ckv_log;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
@@ -1746,6 +1747,41 @@ where
                 }
                 plan
             });
+
+        if is_admitted_routing
+            && ckv_log::enabled()
+            && let Some(rid) = context_id
+        {
+            let mut rec = serde_json::Map::new();
+            rec.insert("rid".into(), rid.into());
+            rec.insert("worker_id".into(), response.best_worker.worker_id.into());
+            rec.insert("dp_rank".into(), response.best_worker.dp_rank.into());
+            rec.insert("prompt_tokens".into(), (isl_tokens as u64).into());
+            rec.insert(
+                "cached_tokens".into(),
+                (response.cached_tokens as u64).into(),
+            );
+            rec.insert(
+                "overlap_blocks".into(),
+                response.effective_overlap_blocks.into(),
+            );
+            rec.insert(
+                "chunks_found".into(),
+                ckv_chunks.map(|c| c.len() as u64).unwrap_or(0).into(),
+            );
+            rec.insert(
+                "planner".into(),
+                self.planner.as_ref().map(|p| p.name().to_string()).into(),
+            );
+            rec.insert(
+                "plan".into(),
+                composition_plan
+                    .as_ref()
+                    .and_then(|p| serde_json::to_value(&p.predicted).ok())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            ckv_log::write("route", rec);
+        }
 
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);

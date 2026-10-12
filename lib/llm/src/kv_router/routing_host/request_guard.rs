@@ -797,7 +797,37 @@ where
         // Metrics must observe the completed request before cleanup releases its state.
         self.observability
             .record_metrics(self.record_itl_at_completion);
+        self.write_ckv_finish();
         self.cleanup.finish().await;
+    }
+
+    /// ComposableKV D-OBS: frontend-side timing for the request (joined with the
+    /// router's `route` record and the worker's records by request id).
+    fn write_ckv_finish(&self) {
+        if !crate::kv_router::ckv_log::enabled() {
+            return;
+        }
+        let Some(rid) = self.cleanup.context_id() else {
+            return;
+        };
+        let mut rec = serde_json::Map::new();
+        rec.insert("rid".into(), rid.into());
+        rec.insert("worker_id".into(), self.cleanup.worker_id().into());
+        rec.insert(
+            "osl".into(),
+            (self.observability.cumulative_osl() as u64).into(),
+        );
+        if let Some(t) = &self.observability.tracker {
+            rec.insert(
+                "request_received_ms".into(),
+                t.request_received_epoch_ms().into(),
+            );
+            rec.insert("ttft_ms".into(), t.ttft_ms().into());
+            rec.insert("prefill_wait_ms".into(), t.prefill_wait_time_ms().into());
+            rec.insert("prefill_ms".into(), t.prefill_time_ms().into());
+            rec.insert("e2e_ms".into(), t.total_time_ms().into());
+        }
+        crate::kv_router::ckv_log::write("finish", rec);
     }
 
     pub(super) async fn abort(&mut self) {
