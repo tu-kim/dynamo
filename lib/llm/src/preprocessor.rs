@@ -2595,12 +2595,15 @@ impl OpenAIPreprocessor {
                 messages,
                 &preprocessed.token_ids,
                 |text| {
+                    // Plain text, no special tokens (the builder's
+                    // add_special_tokens=False). Not every backend implements
+                    // segmented encoding, so fall back to `encode`.
                     let segment = crate::tokenizers::EncodeSegment::new(text, false);
-                    Ok(self
-                        .tokenizer
-                        .encode_segments(&[segment])?
-                        .token_ids()
-                        .to_vec())
+                    let enc = match self.tokenizer.encode_segments(&[segment]) {
+                        Ok(enc) => enc,
+                        Err(_) => self.tokenizer.encode(text)?,
+                    };
+                    Ok(enc.token_ids().to_vec())
                 },
             );
             tracing::debug!(
