@@ -2578,16 +2578,16 @@ impl OpenAIPreprocessor {
 
     /// ComposableKV: D-SEG chunk spans from `nvext.ckv.files` (frontend-only
     /// field) and `nvext.ckv.build` → `extra_args.kv_transfer_params.ckv_build`.
-    fn apply_ckv_ext<R: OAIChatLikeRequest + NvExtProvider>(
+    fn apply_ckv_ext(
         &self,
-        request: &R,
+        nvext: Option<&crate::protocols::common::extensions::NvExt>,
+        messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
         preprocessed: &mut PreprocessedRequest,
     ) -> Result<()> {
-        let Some(ckv) = request.nvext().and_then(|n| n.ckv.as_ref()) else {
+        let Some(ckv) = nvext.and_then(|n| n.ckv.as_ref()) else {
             return Ok(());
         };
         if !ckv.files.is_empty() {
-            let messages = request.typed_messages().unwrap_or(&[]);
             let model_id = crate::ckv_segment::model_id_for(&preprocessed.model);
             let spans = crate::ckv_segment::locate_chunks(
                 &model_id,
@@ -2749,7 +2749,11 @@ impl OpenAIPreprocessor {
         }
 
         let mut preprocessed = builder.build()?;
-        self.apply_ckv_ext(request, &mut preprocessed)?;
+        self.apply_ckv_ext(
+            request.nvext(),
+            request.typed_messages().unwrap_or(&[]),
+            &mut preprocessed,
+        )?;
         if let Some(reasoning_ended) = Self::prompt_injected_reasoning_ended_arg(
             self.runtime_config.reasoning_parser.as_deref(),
             formatted_prompt.as_ref().map(RenderedPrompt::as_str),
@@ -7230,6 +7234,8 @@ impl
             .await?;
 
         let mut common_request = builder.build()?;
+        // ComposableKV: builder requests (`nvext.ckv.build`) come in as completions.
+        self.apply_ckv_ext(request.nvext(), &[], &mut common_request)?;
         Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
         attach_agent_context_from_context(&mut common_request, &context);
 
