@@ -1630,7 +1630,7 @@ where
             planner.pin_worker(&dynamo_kv_router::composition::PlannerInput {
                 prompt_len: isl_tokens as u32,
                 block_size: self.block_size,
-                link_tokens: dynamo_kv_router::composition::LINK_TOKENS,
+                link_tokens: dynamo_kv_router::composition::link_tokens(),
                 chunks,
                 overlap,
                 pi,
@@ -1718,7 +1718,7 @@ where
                 let input = dynamo_kv_router::composition::PlannerInput {
                     prompt_len: isl_tokens as u32,
                     block_size: self.block_size,
-                    link_tokens: dynamo_kv_router::composition::LINK_TOKENS,
+                    link_tokens: dynamo_kv_router::composition::link_tokens(),
                     chunks,
                     overlap,
                     pi,

@@ -22,6 +22,19 @@ use crate::scheduling::OverlapSignals;
 
 /// EPIC link recompute length (SPEC Q5: k = 32).
 pub const LINK_TOKENS: u32 = 32;
+
+/// Link recompute length `k` for this process: `CKV_LINK_TOKENS` (frontend env,
+/// e.g. 64 or 128 to trade PI tokens for accuracy) or [`LINK_TOKENS`]. Read once.
+pub fn link_tokens() -> u32 {
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CKV_LINK_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|k| *k > 0)
+            .unwrap_or(LINK_TOKENS)
+    })
+}
 pub const PLAN_VERSION: u32 = 1;
 
 /// A PI chunk located in the prompt: `start` is the position of the chunk's
