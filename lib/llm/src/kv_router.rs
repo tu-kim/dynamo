@@ -1416,6 +1416,7 @@ where
                     track_lifecycle: false,
                 },
                 None,
+                None,
             )
             .await?
         {
@@ -1467,6 +1468,7 @@ where
                 routing_constraints,
                 FindBestMatchAdmission::WithoutAdmission,
                 None,
+                None,
             )
             .await?
         {
@@ -1499,6 +1501,7 @@ where
         routing_constraints: RoutingConstraints,
         admission: FindBestMatchAdmission,
         ckv_chunks: Option<&[dynamo_kv_router::composition::ChunkSpan]>,
+        ckv_files: Option<&[crate::ckv_segment::CkvFileOutcome]>,
     ) -> anyhow::Result<FindBestMatchInnerOutcome> {
         let start = Instant::now();
 
@@ -1712,13 +1715,14 @@ where
             None
         };
 
+        let link_tokens = dynamo_kv_router::composition::link_tokens();
         let composition_plan = planner_ctx
             .as_ref()
             .and_then(|(planner, chunks, pi, overlap)| {
                 let input = dynamo_kv_router::composition::PlannerInput {
                     prompt_len: isl_tokens as u32,
                     block_size: self.block_size,
-                    link_tokens: dynamo_kv_router::composition::link_tokens(),
+                    link_tokens,
                     chunks,
                     overlap,
                     pi,
@@ -1752,34 +1756,18 @@ where
             && ckv_log::enabled()
             && let Some(rid) = context_id
         {
-            let mut rec = serde_json::Map::new();
-            rec.insert("rid".into(), rid.into());
-            rec.insert("worker_id".into(), response.best_worker.worker_id.into());
-            rec.insert("dp_rank".into(), response.best_worker.dp_rank.into());
-            rec.insert("prompt_tokens".into(), (isl_tokens as u64).into());
-            rec.insert(
-                "cached_tokens".into(),
-                (response.cached_tokens as u64).into(),
-            );
-            rec.insert(
-                "overlap_blocks".into(),
-                response.effective_overlap_blocks.into(),
-            );
-            rec.insert(
-                "chunks_found".into(),
-                ckv_chunks.map(|c| c.len() as u64).unwrap_or(0).into(),
-            );
-            rec.insert(
-                "planner".into(),
-                self.planner.as_ref().map(|p| p.name().to_string()).into(),
-            );
-            rec.insert(
-                "plan".into(),
-                composition_plan
-                    .as_ref()
-                    .and_then(|p| serde_json::to_value(&p.predicted).ok())
-                    .unwrap_or(serde_json::Value::Null),
-            );
+            let rec = ckv_log::route_record(&ckv_log::RouteInfo {
+                rid,
+                worker: response.best_worker,
+                prompt_tokens: isl_tokens as u64,
+                cached_tokens: response.cached_tokens as u64,
+                overlap_blocks: response.effective_overlap_blocks,
+                chunks_found: ckv_chunks.map(|c| c.len() as u64).unwrap_or(0),
+                planner: self.planner.as_ref().map(|p| p.name()),
+                link_tokens,
+                files: ckv_files,
+                plan: composition_plan.as_ref(),
+            });
             ckv_log::write("route", rec);
         }
 

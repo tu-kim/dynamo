@@ -38,12 +38,18 @@ pub fn link_tokens() -> u32 {
 pub const PLAN_VERSION: u32 = 1;
 
 /// A PI chunk located in the prompt: `start` is the position of the chunk's
-/// first token, `len` the chunk's standalone token count.
+/// first token, `len` the chunk's standalone token count. `path` and
+/// `tool_call_id` name the `read` result it came from (D-OBS-2 trace join).
+/// Frontend-only: the worker gets [`PlanSegment`]s, never spans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkSpan {
     pub chunk_hash: String,
     pub start: u32,
     pub len: u32,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub tool_call_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +516,8 @@ mod tests {
             chunk_hash: h.into(),
             start,
             len,
+            path: String::new(),
+            tool_call_id: String::new(),
         }
     }
 

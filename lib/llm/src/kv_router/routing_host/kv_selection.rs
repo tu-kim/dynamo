@@ -62,6 +62,8 @@ pub(super) struct RoutingRequestParts<'a> {
     pub(super) block_mm_infos: Option<&'a [Option<BlockExtraInfo>]>,
     /// ComposableKV PI chunk spans found by the preprocessor (D-SEG).
     pub(super) ckv_chunks: Option<&'a [dynamo_kv_router::composition::ChunkSpan]>,
+    /// ComposableKV per-file location outcomes (D-OBS-2), for the route record.
+    pub(super) ckv_files: Option<&'a [crate::ckv_segment::CkvFileOutcome]>,
 }
 
 impl<'a> RoutingRequestParts<'a> {
@@ -71,6 +73,7 @@ impl<'a> RoutingRequestParts<'a> {
             token_ids,
             block_mm_infos,
             ckv_chunks: request.ckv_chunks.as_deref(),
+            ckv_files: request.ckv_files.as_deref(),
         }
     }
 }
@@ -131,6 +134,7 @@ where
                 args.routing_constraints,
                 args.admission,
                 args.routing_parts.ckv_chunks,
+                args.routing_parts.ckv_files,
             )
             .await?;
         match outcome {

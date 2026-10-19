@@ -276,6 +276,13 @@ pub struct PreprocessedRequest {
     #[serde(skip)]
     pub ckv_chunks: Option<Vec<dynamo_kv_router::composition::ChunkSpan>>,
 
+    /// ComposableKV per-file outcome of chunk location (D-OBS-2), one per
+    /// `nvext.ckv.files` entry in request order. Frontend-only: the router
+    /// logs it in its `route` record so session tool calls join to chunks.
+    #[builder(default)]
+    #[serde(skip)]
+    pub ckv_files: Option<Vec<crate::ckv_segment::CkvFileOutcome>>,
+
     /// Type of prompt
     pub token_ids: Vec<TokenIdType>,
 

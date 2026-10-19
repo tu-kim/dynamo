@@ -2589,7 +2589,7 @@ impl OpenAIPreprocessor {
         };
         if !ckv.files.is_empty() {
             let model_id = crate::ckv_segment::model_id_for(&preprocessed.model);
-            let spans = crate::ckv_segment::locate_chunks(
+            let located = crate::ckv_segment::locate_chunks(
                 &model_id,
                 &ckv.files,
                 messages,
@@ -2608,10 +2608,11 @@ impl OpenAIPreprocessor {
             );
             tracing::debug!(
                 files = ckv.files.len(),
-                chunks = spans.len(),
+                chunks = located.spans.len(),
                 "ckv: chunk spans located"
             );
-            preprocessed.ckv_chunks = Some(spans);
+            preprocessed.ckv_chunks = Some(located.spans);
+            preprocessed.ckv_files = Some(located.files);
         }
         if let Some(build) = &ckv.build {
             let extra_args = preprocessed
