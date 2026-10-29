@@ -1629,6 +1629,23 @@ where
             _ => None,
         };
         let explicit_pin = pinned_worker.is_some();
+        // ComposableKV: every rank the router knows, for the planner's candidate table.
+        let ckv_ranks: Vec<WorkerWithDpRank> = if planner_ctx.is_some() {
+            let mut v: Vec<WorkerWithDpRank> = self
+                .workers_with_configs
+                .borrow()
+                .iter()
+                .flat_map(|(&worker_id, config)| {
+                    let start = config.data_parallel_start_rank;
+                    (start..start.saturating_add(config.data_parallel_size))
+                        .map(move |dp| WorkerWithDpRank::new(worker_id, dp))
+                })
+                .collect();
+            v.sort_by_key(|w| (w.worker_id, w.dp_rank));
+            v
+        } else {
+            Vec::new()
+        };
         let pinned_worker = pinned_worker.or_else(|| {
             let (planner, chunks, pi, overlap) = planner_ctx.as_ref()?;
             planner.pin_worker(&dynamo_kv_router::composition::PlannerInput {
@@ -1639,6 +1656,7 @@ where
                 overlap,
                 pi,
                 candidate_workers: None,
+                ranks: Some(&ckv_ranks),
             })
         });
         // ComposableKV F10 (D-ROUTE-1): the planner's per-candidate composable
@@ -1656,6 +1674,7 @@ where
                             overlap: overlap_snapshot,
                             pi,
                             candidate_workers: None,
+                            ranks: Some(&ckv_ranks),
                         });
                     (!credits.is_empty()).then(|| (credits, planner.credit_weights()))
                 });
@@ -1768,6 +1787,7 @@ where
                     overlap,
                     pi,
                     candidate_workers: None,
+                    ranks: None,
                 };
                 let plan =
                     planner.plan(&input, response.best_worker, response.cached_tokens as u32);

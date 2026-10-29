@@ -281,6 +281,10 @@ pub struct PlannerInput<'a> {
     pub pi: &'a PiIndex,
     /// Workers the scheduler may pick (None = all).
     pub candidate_workers: Option<&'a [WorkerId]>,
+    /// Every rank the router knows (all workers x their dp ranks), so a cold
+    /// rank with neither an overlap signal nor a PI entry is still scored and
+    /// recorded (D-ROUTE-4). None (unit tests): overlap keys ∪ PI index ranks.
+    pub ranks: Option<&'a [WorkerWithDpRank]>,
 }
 
 /// Per-candidate composable match (F10, D-ROUTE): the blocks a rank would
@@ -384,18 +388,8 @@ pub fn prefix_len_for(
 /// The candidate ranks a planner scores: `candidate_workers` if given, else
 /// every rank with an overlap signal or a PI entry.
 pub fn candidate_ranks(input: &PlannerInput<'_>) -> Vec<WorkerWithDpRank> {
-    let mut v: Vec<WorkerWithDpRank> = match input.candidate_workers {
-        Some(ids) => {
-            let ids: std::collections::HashSet<WorkerId> = ids.iter().copied().collect();
-            input
-                .overlap
-                .effective_cached_tokens
-                .keys()
-                .chain(input.pi.workers().iter())
-                .filter(|w| ids.contains(&w.worker_id))
-                .copied()
-                .collect()
-        }
+    let all: Vec<WorkerWithDpRank> = match input.ranks {
+        Some(ranks) => ranks.to_vec(),
         None => input
             .overlap
             .effective_cached_tokens
@@ -403,6 +397,15 @@ pub fn candidate_ranks(input: &PlannerInput<'_>) -> Vec<WorkerWithDpRank> {
             .copied()
             .chain(input.pi.workers())
             .collect(),
+    };
+    let mut v: Vec<WorkerWithDpRank> = match input.candidate_workers {
+        Some(ids) => {
+            let ids: std::collections::HashSet<WorkerId> = ids.iter().copied().collect();
+            all.into_iter()
+                .filter(|w| ids.contains(&w.worker_id))
+                .collect()
+        }
+        None => all,
     };
     v.sort_by_key(|w| (w.worker_id, w.dp_rank));
     v.dedup();
@@ -799,6 +802,7 @@ mod tests {
             overlap: &overlap,
             pi: &pi,
             candidate_workers: None,
+            ranks: None,
         };
         let stub = StubPlanner;
         assert!(stub.pin_worker(&input).is_none()); // selection stays with the cost function
@@ -850,6 +854,7 @@ mod tests {
             overlap: &overlap,
             pi: &pi,
             candidate_workers: None,
+            ranks: None,
         };
         assert!(StubPlanner.plan(&input, w(2), 0).is_none());
     }
@@ -868,6 +873,7 @@ mod tests {
             overlap: &overlap,
             pi: &pi,
             candidate_workers: None,
+            ranks: None,
         };
         assert_eq!(
             p.pin_worker(&input),
@@ -934,6 +940,7 @@ mod tests {
             overlap: &overlap,
             pi: &pi,
             candidate_workers: None,
+            ranks: None,
         };
         let aware = AwarePlanner::default();
         let credits = aware.worker_credits(&input);
@@ -985,6 +992,24 @@ mod tests {
         }
         // the stub credits nothing
         assert!(StubPlanner.worker_credits(&input).is_empty());
+        // explicit ranks (the router's worker list): a cold rank is scored too (D-ROUTE-4)
+        let ranks = [w(1), w(4)];
+        let with_ranks = PlannerInput {
+            ranks: Some(&ranks),
+            ..input
+        };
+        let credits = aware.worker_credits(&with_ranks);
+        let mut got: Vec<u64> = credits.keys().map(|w| w.worker_id).collect();
+        got.sort();
+        assert_eq!(got, vec![1, 4]);
+        assert_eq!(
+            credits[&w(4)],
+            PiCredit {
+                prefix_blocks: 0,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 57
+            }
+        );
         // candidate_workers narrows the set
         let narrowed = PlannerInput {
             candidate_workers: Some(&[2, 3]),
