@@ -333,9 +333,13 @@ pub trait CompositionPlanner: Send + Sync {
 
 /// Which chunks the selected rank can splice, under the single-node
 /// assumption (SPEC Q8): GPU entries must be on that rank with the exact
-/// `(hash, link offset)` and PI length (the worker's PiPool key); DRAM
-/// entries reported by any rank count for every rank and only need to cover
-/// `k + pi_len` tokens (the worker slices the original).
+/// PiPool key and PI length. The worker keys a GPU entry by the **absolute
+/// prompt position of the chunk's token 0** (`PiKey(hash, pos - chunk_offset)`
+/// = the span's `start`; the KV is rotated to that position at load), so a
+/// GPU entry is reusable only when the chunk sits at the same position again
+/// (the next turns of the same session). DRAM entries (offset 0, the
+/// unrotated original) reported by any rank count for every rank and only
+/// need to cover `k + pi_len` tokens (the worker slices and rotates).
 pub fn usable_chunks(
     input: &PlannerInput<'_>,
     worker: WorkerWithDpRank,
@@ -347,12 +351,16 @@ pub fn usable_chunks(
             continue;
         }
         let pi_len = pi_end - pi_start;
-        let gpu = input.pi.holders(&c.chunk_hash, k).into_iter().any(|h| {
-            h.medium == ChunkMedium::Gpu
-                && h.worker_id == worker.worker_id
-                && h.dp_rank == worker.dp_rank
-                && h.num_tokens == pi_len
-        });
+        let gpu = input
+            .pi
+            .holders(&c.chunk_hash, c.start)
+            .into_iter()
+            .any(|h| {
+                h.medium == ChunkMedium::Gpu
+                    && h.worker_id == worker.worker_id
+                    && h.dp_rank == worker.dp_rank
+                    && h.num_tokens == pi_len
+            });
         if gpu {
             out.push((c.clone(), ChunkMedium::Gpu));
             continue;
@@ -788,7 +796,7 @@ mod tests {
     fn t6_4_stub_uses_only_chunks_the_selected_worker_holds() {
         let pi = PiIndex::new();
         // W2 holds chunk a on GPU (exact cut); nobody holds b; c is in DRAM via W3.
-        stored(&pi, w(2), "a", 32, 464, ChunkMedium::Gpu); // pi cut of [0,500) is [32,496)
+        stored(&pi, w(2), "a", 0, 464, ChunkMedium::Gpu); // chunk at prompt position 0; pi cut of [0,500) is [32,496)
         stored(&pi, w(3), "c", 0, 500, ChunkMedium::Dram);
         let chunks = vec![span("a", 0, 500), span("b", 500, 500), span("c", 1000, 500)];
         let mut overlap = OverlapSignals::default();
@@ -843,7 +851,8 @@ mod tests {
     #[test]
     fn t6_4_gpu_entry_with_other_cut_is_not_used() {
         let pi = PiIndex::new();
-        stored(&pi, w(2), "a", 32, 432, ChunkMedium::Gpu); // different PI length
+        stored(&pi, w(2), "a", 16, 464, ChunkMedium::Gpu); // right length, chunk at another position
+        stored(&pi, w(2), "a", 0, 432, ChunkMedium::Gpu); // same position, different PI length
         let chunks = vec![span("a", 0, 500)];
         let overlap = OverlapSignals::default();
         let input = PlannerInput {
@@ -923,8 +932,8 @@ mod tests {
     #[test]
     fn t10_1_worker_credits_per_rank() {
         let pi = PiIndex::new();
-        stored(&pi, w(1), "a", 32, 464, ChunkMedium::Gpu); // exact cut of [0,500): pi [32,496)
-        stored(&pi, w(2), "a", 48, 448, ChunkMedium::Gpu); // other cut: not reusable on GPU
+        stored(&pi, w(1), "a", 0, 464, ChunkMedium::Gpu); // at the span's position 0, pi cut [32,496)
+        stored(&pi, w(2), "a", 1024, 464, ChunkMedium::Gpu); // same chunk at another prompt position: not reusable on GPU
         stored(&pi, w(9), "a", 0, 500, ChunkMedium::Dram); // DRAM original, node-shared
         stored(&pi, w(9), "c", 0, 500, ChunkMedium::Dram);
         let chunks = vec![span("a", 0, 500), span("b", 500, 500), span("c", 1000, 500)];
