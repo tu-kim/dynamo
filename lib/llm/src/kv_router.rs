@@ -1678,9 +1678,9 @@ where
                         });
                     (!credits.is_empty()).then(|| (credits, planner.credit_weights()))
                 });
-        if let Some((credits, (gpu_w, dram_w))) = &ckv_credits {
+        if let Some((credits, weights)) = &ckv_credits {
             overlap.tier_overlap_blocks.ckv_pi_credit_blocks =
-                dynamo_kv_router::composition::weighted_credit_blocks(credits, *gpu_w, *dram_w);
+                dynamo_kv_router::composition::weighted_credit_blocks(credits, *weights);
         }
         let ckv_prev_worker = affinity_target.as_ref().map(|t| WorkerWithDpRank {
             worker_id: t.worker_id,

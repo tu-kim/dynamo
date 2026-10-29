@@ -42,6 +42,38 @@ pub const PLAN_VERSION: u32 = 1;
 /// load is cheaper than recompute but not free).
 pub const DEFAULT_PI_GPU_WEIGHT: f64 = 1.0;
 pub const DEFAULT_PI_DRAM_WEIGHT: f64 = 0.8;
+/// F12 (D-ROUTE-6): a whole-chunk GPU entry at position 0 (prefetch) the worker
+/// re-rotates on use: cheaper than a DRAM load, dearer than an exact hit.
+pub const DEFAULT_PI_GPU_ROTATE_WEIGHT: f64 = 0.9;
+
+/// Credit weights per holding class (D-ROUTE-1/6).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CreditWeights {
+    pub gpu: f64,
+    pub gpu_rotate: f64,
+    pub dram: f64,
+}
+
+impl Default for CreditWeights {
+    fn default() -> Self {
+        Self {
+            gpu: DEFAULT_PI_GPU_WEIGHT,
+            gpu_rotate: DEFAULT_PI_GPU_ROTATE_WEIGHT,
+            dram: DEFAULT_PI_DRAM_WEIGHT,
+        }
+    }
+}
+
+/// Where a candidate rank would take a chunk's PI from (router view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holding {
+    /// Exact PiPool key on that rank: `(hash, span start)` with the PI length.
+    Gpu,
+    /// Whole chunk on that rank at position 0 (F12 prefetch): re-rotated on use.
+    GpuRotate,
+    /// Node DRAM store: loaded (and rotated) on use.
+    Dram,
+}
 
 /// A PI chunk located in the prompt: `start` is the position of the chunk's
 /// first token, `len` the chunk's standalone token count. `path` and
@@ -295,7 +327,17 @@ pub struct PlannerInput<'a> {
 pub struct PiCredit {
     pub prefix_blocks: u32,
     pub pi_gpu_blocks: u32,
+    #[serde(default)]
+    pub pi_gpu_rotate_blocks: u32,
     pub pi_dram_blocks: u32,
+}
+
+impl PiCredit {
+    pub fn weighted(&self, w: CreditWeights) -> f64 {
+        w.gpu * self.pi_gpu_blocks as f64
+            + w.gpu_rotate * self.pi_gpu_rotate_blocks as f64
+            + w.dram * self.pi_dram_blocks as f64
+    }
 }
 
 pub trait CompositionPlanner: Send + Sync {
@@ -309,9 +351,9 @@ pub trait CompositionPlanner: Send + Sync {
         HashMap::new()
     }
 
-    /// `(w_gpu, w_dram)` applied to `worker_credits` before scheduling.
-    fn credit_weights(&self) -> (f64, f64) {
-        (DEFAULT_PI_GPU_WEIGHT, DEFAULT_PI_DRAM_WEIGHT)
+    /// Weights applied to `worker_credits` before scheduling.
+    fn credit_weights(&self) -> CreditWeights {
+        CreditWeights::default()
     }
 
     /// Called before scheduling. `Some(worker)` pins the request to that rank
@@ -343,7 +385,7 @@ pub trait CompositionPlanner: Send + Sync {
 pub fn usable_chunks(
     input: &PlannerInput<'_>,
     worker: WorkerWithDpRank,
-) -> Vec<(ChunkSpan, ChunkMedium)> {
+) -> Vec<(ChunkSpan, Holding)> {
     let mut out = Vec::new();
     for c in input.chunks {
         let (k, pi_start, pi_end) = pi_cut(c, input.block_size, input.link_tokens);
@@ -351,27 +393,32 @@ pub fn usable_chunks(
             continue;
         }
         let pi_len = pi_end - pi_start;
+        let on_rank = |h: &crate::indexer::pi_index::PiHolding| {
+            h.worker_id == worker.worker_id && h.dp_rank == worker.dp_rank
+        };
         let gpu = input
             .pi
             .holders(&c.chunk_hash, c.start)
-            .into_iter()
-            .any(|h| {
-                h.medium == ChunkMedium::Gpu
-                    && h.worker_id == worker.worker_id
-                    && h.dp_rank == worker.dp_rank
-                    && h.num_tokens == pi_len
-            });
+            .iter()
+            .any(|h| h.medium == ChunkMedium::Gpu && on_rank(h) && h.num_tokens == pi_len);
         if gpu {
-            out.push((c.clone(), ChunkMedium::Gpu));
+            out.push((c.clone(), Holding::Gpu));
             continue;
         }
-        let dram = input
-            .pi
-            .holders(&c.chunk_hash, 0)
-            .into_iter()
-            .any(|h| h.medium == ChunkMedium::Dram && h.num_tokens >= k + pi_len);
-        if dram {
-            out.push((c.clone(), ChunkMedium::Dram));
+        // position-0 holders: a GPU whole-chunk (prefetch, F12) on this rank, or the DRAM original
+        let at_zero = input.pi.holders(&c.chunk_hash, 0);
+        if at_zero
+            .iter()
+            .any(|h| h.medium == ChunkMedium::Gpu && on_rank(h) && h.num_tokens >= k + pi_len)
+        {
+            out.push((c.clone(), Holding::GpuRotate));
+            continue;
+        }
+        if at_zero
+            .iter()
+            .any(|h| h.medium == ChunkMedium::Dram && h.num_tokens >= k + pi_len)
+        {
+            out.push((c.clone(), Holding::Dram));
         }
     }
     out
@@ -429,29 +476,31 @@ pub fn credit_for(input: &PlannerInput<'_>, worker: WorkerWithDpRank) -> PiCredi
     let b = input.block_size.max(1);
     let prefix_len = prefix_len_for(input, worker, 0);
     let usable = usable_chunks(input, worker);
-    let medium_of: HashMap<&str, ChunkMedium> = usable
+    let holding_of: HashMap<&str, Holding> = usable
         .iter()
         .map(|(c, m)| (c.chunk_hash.as_str(), *m))
         .collect();
     let chunks: Vec<ChunkSpan> = usable.iter().map(|(c, _)| c.clone()).collect();
-    let (mut gpu, mut dram) = (0u32, 0u32);
+    let (mut gpu, mut rot, mut dram) = (0u32, 0u32, 0u32);
     if let Ok(plan) = make_plan(input.prompt_len, prefix_len, &chunks, b, input.link_tokens) {
         for s in plan.pi_segments() {
             let m = s
                 .chunk_hash
                 .as_deref()
-                .and_then(|h| medium_of.get(h))
+                .and_then(|h| holding_of.get(h))
                 .copied()
-                .unwrap_or(ChunkMedium::Dram);
+                .unwrap_or(Holding::Dram);
             match m {
-                ChunkMedium::Gpu => gpu += s.len,
-                ChunkMedium::Dram => dram += s.len,
+                Holding::Gpu => gpu += s.len,
+                Holding::GpuRotate => rot += s.len,
+                Holding::Dram => dram += s.len,
             }
         }
     }
     PiCredit {
         prefix_blocks: prefix_len / b,
         pi_gpu_blocks: gpu / b,
+        pi_gpu_rotate_blocks: rot / b,
         pi_dram_blocks: dram / b,
     }
 }
@@ -461,18 +510,12 @@ pub fn credit_for(input: &PlannerInput<'_>, worker: WorkerWithDpRank) -> PiCredi
 /// ranks with no PI left out.
 pub fn weighted_credit_blocks(
     credits: &HashMap<WorkerWithDpRank, PiCredit>,
-    gpu_weight: f64,
-    dram_weight: f64,
+    weights: CreditWeights,
 ) -> rustc_hash::FxHashMap<WorkerWithDpRank, f64> {
     credits
         .iter()
-        .filter(|(_, c)| c.pi_gpu_blocks > 0 || c.pi_dram_blocks > 0)
-        .map(|(w, c)| {
-            (
-                *w,
-                gpu_weight * c.pi_gpu_blocks as f64 + dram_weight * c.pi_dram_blocks as f64,
-            )
-        })
+        .filter(|(_, c)| c.pi_gpu_blocks > 0 || c.pi_gpu_rotate_blocks > 0 || c.pi_dram_blocks > 0)
+        .map(|(w, c)| (*w, c.weighted(weights)))
         .collect()
 }
 
@@ -487,6 +530,7 @@ pub struct StubPlanner;
 #[derive(Debug, Clone, Default)]
 pub struct AwarePlanner {
     pub gpu_weight: Option<f64>,
+    pub gpu_rotate_weight: Option<f64>,
     pub dram_weight: Option<f64>,
 }
 
@@ -508,6 +552,7 @@ impl AwarePlanner {
             }
             match k.trim() {
                 "gpu" => p.gpu_weight = Some(v),
+                "gpu_rotate" => p.gpu_rotate_weight = Some(v),
                 "dram" => p.dram_weight = Some(v),
                 other => return Err(format!("{AWARE_PLANNER}: unknown parameter {other:?}")),
             }
@@ -528,11 +573,14 @@ impl CompositionPlanner for AwarePlanner {
             .collect()
     }
 
-    fn credit_weights(&self) -> (f64, f64) {
-        (
-            self.gpu_weight.unwrap_or(DEFAULT_PI_GPU_WEIGHT),
-            self.dram_weight.unwrap_or(DEFAULT_PI_DRAM_WEIGHT),
-        )
+    fn credit_weights(&self) -> CreditWeights {
+        CreditWeights {
+            gpu: self.gpu_weight.unwrap_or(DEFAULT_PI_GPU_WEIGHT),
+            gpu_rotate: self
+                .gpu_rotate_weight
+                .unwrap_or(DEFAULT_PI_GPU_ROTATE_WEIGHT),
+            dram: self.dram_weight.unwrap_or(DEFAULT_PI_DRAM_WEIGHT),
+        }
     }
 
     fn plan(
@@ -962,6 +1010,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 0,
                 pi_gpu_blocks: 29,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 28
             }
         );
@@ -970,6 +1019,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 0,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 57
             }
         );
@@ -978,6 +1028,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 63,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 28
             }
         );
@@ -986,6 +1037,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 0,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 57
             }
         );
@@ -995,7 +1047,7 @@ mod tests {
             let c = &credits[&w(r)];
             assert_eq!(
                 plan.predicted.pi / B,
-                c.pi_gpu_blocks + c.pi_dram_blocks,
+                c.pi_gpu_blocks + c.pi_gpu_rotate_blocks + c.pi_dram_blocks,
                 "rank {r}"
             );
         }
@@ -1016,6 +1068,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 0,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 57
             }
         );
@@ -1044,15 +1097,16 @@ mod tests {
         assert!(AwarePlanner::parse("gpu=-1").is_err());
         assert!(resolve_planner("ckv-aware:dram=0.7").is_ok());
         assert_eq!(
-            resolve_planner("ckv-aware:dram=0.7")
+            resolve_planner("ckv-aware:dram=0.7,gpu_rotate=0.5")
                 .unwrap()
                 .credit_weights(),
-            (1.0, 0.7)
+            CreditWeights {
+                gpu: 1.0,
+                gpu_rotate: 0.5,
+                dram: 0.7
+            }
         );
-        assert_eq!(
-            StubPlanner.credit_weights(),
-            (DEFAULT_PI_GPU_WEIGHT, DEFAULT_PI_DRAM_WEIGHT)
-        );
+        assert_eq!(StubPlanner.credit_weights(), CreditWeights::default());
         // weighted blocks: gpu 1.0, dram 0.5; ranks without PI are left out
         let mut credits = HashMap::new();
         credits.insert(
@@ -1060,6 +1114,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 3,
                 pi_gpu_blocks: 29,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 28,
             },
         );
@@ -1068,11 +1123,60 @@ mod tests {
             PiCredit {
                 prefix_blocks: 63,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 0,
             },
         );
-        let wb = weighted_credit_blocks(&credits, 1.0, 0.5);
+        let wb = weighted_credit_blocks(
+            &credits,
+            CreditWeights {
+                gpu: 1.0,
+                gpu_rotate: 0.9,
+                dram: 0.5,
+            },
+        );
         assert_eq!(wb.len(), 1);
         assert_eq!(wb[&w(1)], 29.0 + 14.0);
+    }
+
+    /// T12-4 (D-ROUTE-6): a whole-chunk GPU entry at position 0 on the rank counts
+    /// as GpuRotate (any cut), an exact-position entry as Gpu, otherwise DRAM; a
+    /// short position-0 GPU entry does not qualify.
+    #[test]
+    fn t12_4_prefetched_whole_chunk_credits_gpu_rotate() {
+        let pi = PiIndex::new();
+        stored(&pi, w(1), "a", 0, 500, ChunkMedium::Gpu); // prefetched whole chunk on rank 1
+        stored(&pi, w(2), "a", 0, 300, ChunkMedium::Gpu); // too short for k + pi_len (32 + 464)
+        stored(&pi, w(9), "a", 0, 500, ChunkMedium::Dram);
+        stored(&pi, w(3), "a", 1024, 464, ChunkMedium::Gpu); // exact key for a span starting at 1024
+        let overlap = OverlapSignals::default();
+        let chunks = vec![span("a", 1024, 500)];
+        let input = PlannerInput {
+            prompt_len: 1600,
+            block_size: B,
+            link_tokens: LINK_TOKENS,
+            chunks: &chunks,
+            overlap: &overlap,
+            pi: &pi,
+            candidate_workers: None,
+            ranks: None,
+        };
+        let h = |r: u64| {
+            usable_chunks(&input, w(r))
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(h(1), vec![Holding::GpuRotate]);
+        assert_eq!(h(2), vec![Holding::Dram]);
+        assert_eq!(h(3), vec![Holding::Gpu]);
+        assert_eq!(h(9), vec![Holding::Dram]);
+        let credits = AwarePlanner::default().worker_credits(&input);
+        assert_eq!(credits[&w(1)].pi_gpu_rotate_blocks, 29);
+        assert_eq!(credits[&w(3)].pi_gpu_blocks, 29);
+        assert_eq!(credits[&w(2)].pi_dram_blocks, 29);
+        let wb = weighted_credit_blocks(&credits, CreditWeights::default());
+        assert!(wb[&w(3)] > wb[&w(1)] && wb[&w(1)] > wb[&w(2)]);
+        assert_eq!(wb[&w(1)], 0.9 * 29.0);
     }
 }

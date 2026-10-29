@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 use std::collections::HashMap;
 
-use dynamo_kv_router::composition::{CompositionPlan, PiCredit};
+use dynamo_kv_router::composition::{CompositionPlan, CreditWeights, PiCredit};
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 
 use crate::ckv_segment::CkvFileOutcome;
@@ -61,7 +61,7 @@ pub struct RouteInfo<'a> {
     /// weights it was folded in with, how the worker was chosen, and the
     /// session's previous worker (from the request host's affinity target).
     pub credits: Option<&'a HashMap<WorkerWithDpRank, PiCredit>>,
-    pub credit_weights: Option<(f64, f64)>,
+    pub credit_weights: Option<CreditWeights>,
     pub chosen_by: &'a str,
     pub prev_worker: Option<WorkerWithDpRank>,
     pub session_id: Option<&'a str>,
@@ -102,7 +102,11 @@ pub fn route_record(info: &RouteInfo<'_>) -> serde_json::Map<String, serde_json:
     );
     // D-ROUTE-5: candidates sorted by rank; `credit_blocks` is what the
     // selector added (`w_gpu * pi_gpu + w_dram * pi_dram`).
-    let (wg, wd) = info.credit_weights.unwrap_or((0.0, 0.0));
+    let weights = info.credit_weights.unwrap_or(CreditWeights {
+        gpu: 0.0,
+        gpu_rotate: 0.0,
+        dram: 0.0,
+    });
     let candidates: Vec<Value> = info
         .credits
         .map(|c| {
@@ -115,8 +119,9 @@ pub fn route_record(info: &RouteInfo<'_>) -> serde_json::Map<String, serde_json:
                         "dp_rank": w.dp_rank,
                         "prefix_blocks": c.prefix_blocks,
                         "pi_gpu_blocks": c.pi_gpu_blocks,
+                        "pi_gpu_rotate_blocks": c.pi_gpu_rotate_blocks,
                         "pi_dram_blocks": c.pi_dram_blocks,
-                        "credit_blocks": wg * c.pi_gpu_blocks as f64 + wd * c.pi_dram_blocks as f64,
+                        "credit_blocks": c.weighted(weights),
                     })
                 })
                 .collect()
@@ -126,7 +131,7 @@ pub fn route_record(info: &RouteInfo<'_>) -> serde_json::Map<String, serde_json:
     rec.insert(
         "credit_weights".into(),
         info.credit_weights
-            .map(|(g, d)| serde_json::json!({"gpu": g, "dram": d}))
+            .map(|w| serde_json::json!({"gpu": w.gpu, "gpu_rotate": w.gpu_rotate, "dram": w.dram}))
             .unwrap_or(Value::Null),
     );
     rec.insert("chosen_by".into(), info.chosen_by.into());
@@ -357,6 +362,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 0,
                 pi_gpu_blocks: 0,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 28,
             },
         );
@@ -365,6 +371,7 @@ mod tests {
             PiCredit {
                 prefix_blocks: 4,
                 pi_gpu_blocks: 29,
+                pi_gpu_rotate_blocks: 0,
                 pi_dram_blocks: 28,
             },
         );
@@ -380,7 +387,11 @@ mod tests {
             files: None,
             plan: None,
             credits: Some(&credits),
-            credit_weights: Some((1.0, 0.5)),
+            credit_weights: Some(CreditWeights {
+                gpu: 1.0,
+                gpu_rotate: 0.9,
+                dram: 0.5,
+            }),
             chosen_by: "argmin",
             prev_worker: Some(w(2)),
             session_id: Some("s1"),
