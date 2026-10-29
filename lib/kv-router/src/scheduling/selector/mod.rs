@@ -228,6 +228,7 @@ impl<'a> MaterializedSelectionInput<'a> {
                     .copied()
                     .unwrap_or(0) as f64,
                 shared_beyond_device_blocks: shared_beyond(device_overlap_blocks),
+                ckv_pi_credit_blocks: self.request.ckv_pi_credit_blocks_for(worker),
             }
         } else {
             WorkerCacheInput::default()

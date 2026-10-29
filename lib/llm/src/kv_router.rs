@@ -1598,7 +1598,7 @@ where
             })
             .unwrap_or((None, None));
 
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
         let router_hint_candidates = retain_router_hint_chain
@@ -1628,6 +1628,7 @@ where
             }
             _ => None,
         };
+        let explicit_pin = pinned_worker.is_some();
         let pinned_worker = pinned_worker.or_else(|| {
             let (planner, chunks, pi, overlap) = planner_ctx.as_ref()?;
             planner.pin_worker(&dynamo_kv_router::composition::PlannerInput {
@@ -1640,6 +1641,46 @@ where
                 candidate_workers: None,
             })
         });
+        // ComposableKV F10 (D-ROUTE-1): the planner's per-candidate composable
+        // match becomes credit blocks the selector adds to the device overlap.
+        let ckv_credits =
+            planner_ctx
+                .as_ref()
+                .and_then(|(planner, chunks, pi, overlap_snapshot)| {
+                    let credits =
+                        planner.worker_credits(&dynamo_kv_router::composition::PlannerInput {
+                            prompt_len: isl_tokens as u32,
+                            block_size: self.block_size,
+                            link_tokens: dynamo_kv_router::composition::link_tokens(),
+                            chunks,
+                            overlap: overlap_snapshot,
+                            pi,
+                            candidate_workers: None,
+                        });
+                    (!credits.is_empty()).then(|| (credits, planner.credit_weights()))
+                });
+        if let Some((credits, (gpu_w, dram_w))) = &ckv_credits {
+            overlap.tier_overlap_blocks.ckv_pi_credit_blocks =
+                dynamo_kv_router::composition::weighted_credit_blocks(credits, *gpu_w, *dram_w);
+        }
+        let ckv_prev_worker = affinity_target.as_ref().map(|t| WorkerWithDpRank {
+            worker_id: t.worker_id,
+            dp_rank: t.dp_rank.unwrap_or(0),
+        });
+        let ckv_session_id = session_context.as_ref().map(|s| s.session_id().to_string());
+        let ckv_chosen_by = if explicit_pin {
+            "pinned"
+        } else if pinned_worker.is_some() {
+            "planner_pin"
+        } else if router_config_override
+            .and_then(|c| c.router_temperature)
+            .unwrap_or(self.kv_router_config.router_temperature)
+            > 0.0
+        {
+            "sampled"
+        } else {
+            "argmin"
+        };
 
         let allowed_worker_ids = self.narrow_allowed_by_lora(
             lora_name.as_deref(),
@@ -1767,6 +1808,11 @@ where
                 link_tokens,
                 files: ckv_files,
                 plan: composition_plan.as_ref(),
+                credits: ckv_credits.as_ref().map(|(c, _)| c),
+                credit_weights: ckv_credits.as_ref().map(|(_, w)| *w),
+                chosen_by: ckv_chosen_by,
+                prev_worker: ckv_prev_worker,
+                session_id: ckv_session_id.as_deref(),
             });
             ckv_log::write("route", rec);
         }

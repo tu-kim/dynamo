@@ -83,6 +83,13 @@ pub struct TierOverlapBlocks {
     pub host_pinned: FxHashMap<WorkerWithDpRank, usize>,
     #[serde(default)]
     pub disk: FxHashMap<WorkerWithDpRank, usize>,
+    /// ComposableKV (F10, D-ROUTE-1): per-rank PI credit in blocks, already
+    /// weighted (`w_gpu * pi_gpu + w_dram * pi_dram` from the planner's
+    /// `worker_credits`). Added to the overlap credit under the same load
+    /// decay as the device prefix hit. Not a cache tier: it does not switch
+    /// the device-overlap source (`has_tier_overlap_blocks`).
+    #[serde(default)]
+    pub ckv_pi_credit_blocks: FxHashMap<WorkerWithDpRank, f64>,
 }
 
 /// Downstream matches must include a wildcard arm because this enum is non-exhaustive.
@@ -509,6 +516,16 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Weighted ComposableKV PI credit for a rank (0 when the planner sent none).
+    pub(crate) fn ckv_pi_credit_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {
+        self.overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .get(&worker)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     pub(crate) fn effective_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {

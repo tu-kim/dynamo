@@ -11,7 +11,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-use dynamo_kv_router::composition::CompositionPlan;
+use std::collections::HashMap;
+
+use dynamo_kv_router::composition::{CompositionPlan, PiCredit};
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 
 use crate::ckv_segment::CkvFileOutcome;
@@ -55,6 +57,14 @@ pub struct RouteInfo<'a> {
     /// Per-file location outcomes, in `nvext.ckv.files` order.
     pub files: Option<&'a [CkvFileOutcome]>,
     pub plan: Option<&'a CompositionPlan>,
+    /// F10 (D-ROUTE-5): the planner's per-candidate composable match, the
+    /// weights it was folded in with, how the worker was chosen, and the
+    /// session's previous worker (from the request host's affinity target).
+    pub credits: Option<&'a HashMap<WorkerWithDpRank, PiCredit>>,
+    pub credit_weights: Option<(f64, f64)>,
+    pub chosen_by: &'a str,
+    pub prev_worker: Option<WorkerWithDpRank>,
+    pub session_id: Option<&'a str>,
 }
 
 /// The `route` record (D-OBS, D-OBS-2): `plan` is the predicted summary,
@@ -90,6 +100,49 @@ pub fn route_record(info: &RouteInfo<'_>) -> serde_json::Map<String, serde_json:
             .and_then(|f| serde_json::to_value(f).ok())
             .unwrap_or_else(|| Value::Array(Vec::new())),
     );
+    // D-ROUTE-5: candidates sorted by rank; `credit_blocks` is what the
+    // selector added (`w_gpu * pi_gpu + w_dram * pi_dram`).
+    let (wg, wd) = info.credit_weights.unwrap_or((0.0, 0.0));
+    let candidates: Vec<Value> = info
+        .credits
+        .map(|c| {
+            let mut v: Vec<(&WorkerWithDpRank, &PiCredit)> = c.iter().collect();
+            v.sort_by_key(|(w, _)| (w.worker_id, w.dp_rank));
+            v.into_iter()
+                .map(|(w, c)| {
+                    serde_json::json!({
+                        "worker_id": w.worker_id,
+                        "dp_rank": w.dp_rank,
+                        "prefix_blocks": c.prefix_blocks,
+                        "pi_gpu_blocks": c.pi_gpu_blocks,
+                        "pi_dram_blocks": c.pi_dram_blocks,
+                        "credit_blocks": wg * c.pi_gpu_blocks as f64 + wd * c.pi_dram_blocks as f64,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rec.insert("candidates".into(), Value::Array(candidates));
+    rec.insert(
+        "credit_weights".into(),
+        info.credit_weights
+            .map(|(g, d)| serde_json::json!({"gpu": g, "dram": d}))
+            .unwrap_or(Value::Null),
+    );
+    rec.insert("chosen_by".into(), info.chosen_by.into());
+    rec.insert(
+        "prev_worker".into(),
+        info.prev_worker
+            .map(|w| w.worker_id.into())
+            .unwrap_or(Value::Null),
+    );
+    rec.insert(
+        "moved".into(),
+        info.prev_worker
+            .map(|p| Value::Bool(p.worker_id != info.worker.worker_id))
+            .unwrap_or(Value::Null),
+    );
+    rec.insert("session_id".into(), info.session_id.into());
     rec
 }
 
@@ -161,6 +214,11 @@ mod tests {
             link_tokens: 32,
             files: Some(&files),
             plan: Some(&plan),
+            credits: None,
+            credit_weights: None,
+            chosen_by: "argmin",
+            prev_worker: None,
+            session_id: None,
         });
         let v = serde_json::Value::Object(rec);
         assert_eq!(v["rid"], "r1");
@@ -222,6 +280,11 @@ mod tests {
             link_tokens: 64,
             files: None,
             plan: None,
+            credits: None,
+            credit_weights: None,
+            chosen_by: "argmin",
+            prev_worker: None,
+            session_id: None,
         });
         let v = serde_json::Value::Object(rec);
         assert_eq!(v["segments"], serde_json::Value::Null);
@@ -246,6 +309,11 @@ mod tests {
             link_tokens: 32,
             files: Some(&files),
             plan: None,
+            credits: None,
+            credit_weights: None,
+            chosen_by: "argmin",
+            prev_worker: None,
+            session_id: None,
         });
         let v = serde_json::Value::Object(rec);
         assert_eq!(v["files"][0]["status"], "tokenize_error");
@@ -273,5 +341,85 @@ mod tests {
         assert_eq!(v["rid"], "r1");
         assert_eq!(v["worker_id"], 7);
         assert!(v["ts"].as_f64().unwrap() > 0.0);
+    }
+
+    /// D-ROUTE-5: candidates (sorted by rank, weighted credit), how the worker
+    /// was chosen, the session's previous worker and whether it moved.
+    #[test]
+    fn t10_3_route_record_has_candidates_and_move() {
+        let w = |id: u64| WorkerWithDpRank {
+            worker_id: id,
+            dp_rank: 0,
+        };
+        let mut credits = HashMap::new();
+        credits.insert(
+            w(2),
+            PiCredit {
+                prefix_blocks: 0,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 28,
+            },
+        );
+        credits.insert(
+            w(1),
+            PiCredit {
+                prefix_blocks: 4,
+                pi_gpu_blocks: 29,
+                pi_dram_blocks: 28,
+            },
+        );
+        let rec = route_record(&RouteInfo {
+            rid: "r2",
+            worker: w(1),
+            prompt_tokens: 1600,
+            cached_tokens: 64,
+            overlap_blocks: 4.0,
+            chunks_found: 2,
+            planner: Some("ckv-aware"),
+            link_tokens: 32,
+            files: None,
+            plan: None,
+            credits: Some(&credits),
+            credit_weights: Some((1.0, 0.5)),
+            chosen_by: "argmin",
+            prev_worker: Some(w(2)),
+            session_id: Some("s1"),
+        });
+        let v = serde_json::Value::Object(rec);
+        let c = v["candidates"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["worker_id"], 1);
+        assert_eq!(c[0]["pi_gpu_blocks"], 29);
+        assert_eq!(c[0]["credit_blocks"], 29.0 + 14.0);
+        assert_eq!(c[1]["worker_id"], 2);
+        assert_eq!(c[1]["credit_blocks"], 14.0);
+        assert_eq!(v["credit_weights"]["dram"], 0.5);
+        assert_eq!(v["chosen_by"], "argmin");
+        assert_eq!(v["prev_worker"], 2);
+        assert_eq!(v["moved"], true);
+        assert_eq!(v["session_id"], "s1");
+        // without a planner: empty candidates, nulls
+        let rec = route_record(&RouteInfo {
+            rid: "r3",
+            worker: w(1),
+            prompt_tokens: 16,
+            cached_tokens: 0,
+            overlap_blocks: 0.0,
+            chunks_found: 0,
+            planner: None,
+            link_tokens: 32,
+            files: None,
+            plan: None,
+            credits: None,
+            credit_weights: None,
+            chosen_by: "argmin",
+            prev_worker: None,
+            session_id: None,
+        });
+        let v = serde_json::Value::Object(rec);
+        assert_eq!(v["candidates"].as_array().unwrap().len(), 0);
+        assert!(
+            v["credit_weights"].is_null() && v["prev_worker"].is_null() && v["moved"].is_null()
+        );
     }
 }

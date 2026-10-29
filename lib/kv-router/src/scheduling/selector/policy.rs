@@ -88,6 +88,8 @@ pub struct WorkerCacheInput {
     pub(super) host_overlap_blocks: f64,
     pub(super) disk_overlap_blocks: f64,
     pub(super) shared_beyond_device_blocks: u32,
+    /// ComposableKV PI credit (weighted blocks, F10); internal to the default scorer.
+    pub(super) ckv_pi_credit_blocks: f64,
 }
 
 /// Active-load values for one worker.

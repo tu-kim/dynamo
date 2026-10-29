@@ -85,6 +85,17 @@ impl PiIndex {
         self.inner.lock().unwrap().clear();
     }
 
+    /// Every rank with at least one entry on any medium (sorted), for the
+    /// router's candidate set (D-ROUTE-4: ranks without entries get no credit
+    /// but stay candidates through the overlap signals).
+    pub fn workers(&self) -> Vec<WorkerWithDpRank> {
+        let inner = self.inner.lock().unwrap();
+        let mut v: Vec<WorkerWithDpRank> = inner.keys().map(|(w, _)| *w).collect();
+        v.sort_by_key(|w| (w.worker_id, w.dp_rank));
+        v.dedup();
+        v
+    }
+
     /// Every rank/medium holding `(chunk_hash, offset)`.
     pub fn holders(&self, chunk_hash: &str, offset: u32) -> Vec<PiHolding> {
         let key = PiKey {

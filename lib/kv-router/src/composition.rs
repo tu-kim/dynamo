@@ -37,6 +37,12 @@ pub fn link_tokens() -> u32 {
 }
 pub const PLAN_VERSION: u32 = 1;
 
+/// D-ROUTE-1 default credit weights: PI already in the rank's GPU pool counts
+/// like its device prefix hit; PI it must load from DRAM a little less (the
+/// load is cheaper than recompute but not free).
+pub const DEFAULT_PI_GPU_WEIGHT: f64 = 1.0;
+pub const DEFAULT_PI_DRAM_WEIGHT: f64 = 0.8;
+
 /// A PI chunk located in the prompt: `start` is the position of the chunk's
 /// first token, `len` the chunk's standalone token count. `path` and
 /// `tool_call_id` name the `read` result it came from (D-OBS-2 trace join).
@@ -277,8 +283,32 @@ pub struct PlannerInput<'a> {
     pub candidate_workers: Option<&'a [WorkerId]>,
 }
 
+/// Per-candidate composable match (F10, D-ROUTE): the blocks a rank would
+/// not prefill. `prefix_blocks` from the overlap signals, `pi_gpu_blocks`
+/// from PI entries already in that rank's GPU pool (exact cut), and
+/// `pi_dram_blocks` from entries it would load from the node DRAM store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiCredit {
+    pub prefix_blocks: u32,
+    pub pi_gpu_blocks: u32,
+    pub pi_dram_blocks: u32,
+}
+
 pub trait CompositionPlanner: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Called before scheduling: the composable match of every candidate
+    /// rank, folded into the selector's cost as credit blocks (D-ROUTE-1).
+    /// Empty (the default and the stub) means no PI credit: selection by
+    /// prefix overlap and load only.
+    fn worker_credits(&self, _input: &PlannerInput<'_>) -> HashMap<WorkerWithDpRank, PiCredit> {
+        HashMap::new()
+    }
+
+    /// `(w_gpu, w_dram)` applied to `worker_credits` before scheduling.
+    fn credit_weights(&self) -> (f64, f64) {
+        (DEFAULT_PI_GPU_WEIGHT, DEFAULT_PI_DRAM_WEIGHT)
+    }
 
     /// Called before scheduling. `Some(worker)` pins the request to that rank
     /// (an explicit pin in the request wins). The stub returns `None` so the
@@ -351,10 +381,158 @@ pub fn prefix_len_for(
     aligned.min(input.prompt_len / input.block_size * input.block_size)
 }
 
+/// The candidate ranks a planner scores: `candidate_workers` if given, else
+/// every rank with an overlap signal or a PI entry.
+pub fn candidate_ranks(input: &PlannerInput<'_>) -> Vec<WorkerWithDpRank> {
+    let mut v: Vec<WorkerWithDpRank> = match input.candidate_workers {
+        Some(ids) => {
+            let ids: std::collections::HashSet<WorkerId> = ids.iter().copied().collect();
+            input
+                .overlap
+                .effective_cached_tokens
+                .keys()
+                .chain(input.pi.workers().iter())
+                .filter(|w| ids.contains(&w.worker_id))
+                .copied()
+                .collect()
+        }
+        None => input
+            .overlap
+            .effective_cached_tokens
+            .keys()
+            .copied()
+            .chain(input.pi.workers())
+            .collect(),
+    };
+    v.sort_by_key(|w| (w.worker_id, w.dp_rank));
+    v.dedup();
+    v
+}
+
+/// The composable match of one rank (D-ROUTE-2): the plan the stub would send
+/// if this rank were selected, split by where its PI segments come from. The
+/// prefix hit is the overlap prediction (`cached_tokens` is unknown before
+/// scheduling), so `pi_gpu + pi_dram` equals the sent plan's `predicted.pi`
+/// whenever the scheduler reports the same hit.
+pub fn credit_for(input: &PlannerInput<'_>, worker: WorkerWithDpRank) -> PiCredit {
+    let b = input.block_size.max(1);
+    let prefix_len = prefix_len_for(input, worker, 0);
+    let usable = usable_chunks(input, worker);
+    let medium_of: HashMap<&str, ChunkMedium> = usable
+        .iter()
+        .map(|(c, m)| (c.chunk_hash.as_str(), *m))
+        .collect();
+    let chunks: Vec<ChunkSpan> = usable.iter().map(|(c, _)| c.clone()).collect();
+    let (mut gpu, mut dram) = (0u32, 0u32);
+    if let Ok(plan) = make_plan(input.prompt_len, prefix_len, &chunks, b, input.link_tokens) {
+        for s in plan.pi_segments() {
+            let m = s
+                .chunk_hash
+                .as_deref()
+                .and_then(|h| medium_of.get(h))
+                .copied()
+                .unwrap_or(ChunkMedium::Dram);
+            match m {
+                ChunkMedium::Gpu => gpu += s.len,
+                ChunkMedium::Dram => dram += s.len,
+            }
+        }
+    }
+    PiCredit {
+        prefix_blocks: prefix_len / b,
+        pi_gpu_blocks: gpu / b,
+        pi_dram_blocks: dram / b,
+    }
+}
+
+/// The per-rank credit the selector adds to its overlap credit
+/// (`TierOverlapBlocks::ckv_pi_credit_blocks`): `w_gpu * pi_gpu + w_dram * pi_dram`,
+/// ranks with no PI left out.
+pub fn weighted_credit_blocks(
+    credits: &HashMap<WorkerWithDpRank, PiCredit>,
+    gpu_weight: f64,
+    dram_weight: f64,
+) -> rustc_hash::FxHashMap<WorkerWithDpRank, f64> {
+    credits
+        .iter()
+        .filter(|(_, c)| c.pi_gpu_blocks > 0 || c.pi_dram_blocks > 0)
+        .map(|(w, c)| {
+            (
+                *w,
+                gpu_weight * c.pi_gpu_blocks as f64 + dram_weight * c.pi_dram_blocks as f64,
+            )
+        })
+        .collect()
+}
+
 /// D-PLAN-2 stub: worker selection untouched; plan = every PI chunk the
 /// selected rank holds after its prefix hit.
 #[derive(Debug, Default)]
 pub struct StubPlanner;
+
+/// F10 `ckv-aware`: selection credits every candidate's composable match
+/// (D-ROUTE-1); the plan is the stub's. Parameters `gpu=<f64>,dram=<f64>`
+/// override the router's credit weights for this planner.
+#[derive(Debug, Clone, Default)]
+pub struct AwarePlanner {
+    pub gpu_weight: Option<f64>,
+    pub dram_weight: Option<f64>,
+}
+
+pub const AWARE_PLANNER: &str = "ckv-aware";
+
+impl AwarePlanner {
+    pub fn parse(params: &str) -> Result<Self, String> {
+        let mut p = Self::default();
+        for kv in params.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| format!("{AWARE_PLANNER}: expected key=value, got {kv:?}"))?;
+            let v: f64 = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("{AWARE_PLANNER}: bad number for {k:?}: {v:?}"))?;
+            if !(0.0..=10.0).contains(&v) {
+                return Err(format!("{AWARE_PLANNER}: {k}={v} out of range [0, 10]"));
+            }
+            match k.trim() {
+                "gpu" => p.gpu_weight = Some(v),
+                "dram" => p.dram_weight = Some(v),
+                other => return Err(format!("{AWARE_PLANNER}: unknown parameter {other:?}")),
+            }
+        }
+        Ok(p)
+    }
+}
+
+impl CompositionPlanner for AwarePlanner {
+    fn name(&self) -> &str {
+        AWARE_PLANNER
+    }
+
+    fn worker_credits(&self, input: &PlannerInput<'_>) -> HashMap<WorkerWithDpRank, PiCredit> {
+        candidate_ranks(input)
+            .into_iter()
+            .map(|w| (w, credit_for(input, w)))
+            .collect()
+    }
+
+    fn credit_weights(&self) -> (f64, f64) {
+        (
+            self.gpu_weight.unwrap_or(DEFAULT_PI_GPU_WEIGHT),
+            self.dram_weight.unwrap_or(DEFAULT_PI_DRAM_WEIGHT),
+        )
+    }
+
+    fn plan(
+        &self,
+        input: &PlannerInput<'_>,
+        worker: WorkerWithDpRank,
+        cached_tokens: u32,
+    ) -> Option<CompositionPlan> {
+        StubPlanner.plan(input, worker, cached_tokens)
+    }
+}
 
 pub const STUB_PLANNER: &str = "ckv-stub";
 pub const PIN_WORKER_PLANNER: &str = "ckv-pin-worker";
@@ -487,6 +665,12 @@ pub fn register_builtin_planners() {
     let _ = r.register(
         STUB_PLANNER,
         Arc::new(|_| Ok(Arc::new(StubPlanner) as Arc<dyn CompositionPlanner>)),
+    );
+    let _ = r.register(
+        AWARE_PLANNER,
+        Arc::new(|params: &str| {
+            Ok(Arc::new(AwarePlanner::parse(params)?) as Arc<dyn CompositionPlanner>)
+        }),
     );
     let _ = r.register(
         PIN_WORKER_PLANNER,
@@ -724,5 +908,137 @@ mod tests {
         assert_eq!(v["segments"][2]["chunk_offset"], 32);
         assert!(v["segments"][0].get("chunk_hash").is_none());
         assert_eq!(v["predicted"]["pi"], 4064);
+    }
+
+    /// T10-1: per-rank composable match. W1 holds chunk a on GPU at the exact
+    /// cut, W2 holds it at another cut (-> DRAM), W3 nothing; c is DRAM for all;
+    /// b has no holder; W1's prefix hit covers chunk a entirely (no PI credit
+    /// for it there, only prefix blocks).
+    #[test]
+    fn t10_1_worker_credits_per_rank() {
+        let pi = PiIndex::new();
+        stored(&pi, w(1), "a", 32, 464, ChunkMedium::Gpu); // exact cut of [0,500): pi [32,496)
+        stored(&pi, w(2), "a", 48, 448, ChunkMedium::Gpu); // other cut: not reusable on GPU
+        stored(&pi, w(9), "a", 0, 500, ChunkMedium::Dram); // DRAM original, node-shared
+        stored(&pi, w(9), "c", 0, 500, ChunkMedium::Dram);
+        let chunks = vec![span("a", 0, 500), span("b", 500, 500), span("c", 1000, 500)];
+        let mut overlap = OverlapSignals::default();
+        overlap.effective_cached_tokens.insert(w(1), 0);
+        overlap.effective_cached_tokens.insert(w(2), 0);
+        overlap.effective_cached_tokens.insert(w(3), 1008); // 63 blocks: covers a and most of b
+        let input = PlannerInput {
+            prompt_len: 1600,
+            block_size: B,
+            link_tokens: LINK_TOKENS,
+            chunks: &chunks,
+            overlap: &overlap,
+            pi: &pi,
+            candidate_workers: None,
+        };
+        let aware = AwarePlanner::default();
+        let credits = aware.worker_credits(&input);
+        let mut ranks: Vec<u64> = credits.keys().map(|w| w.worker_id).collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![1, 2, 3, 9]); // overlap keys ∪ PI index ranks
+        // a: pi [32,496) = 464 tokens = 29 blocks; c: pi [1040,1488) = 448 = 28 blocks
+        assert_eq!(
+            credits[&w(1)],
+            PiCredit {
+                prefix_blocks: 0,
+                pi_gpu_blocks: 29,
+                pi_dram_blocks: 28
+            }
+        );
+        assert_eq!(
+            credits[&w(2)],
+            PiCredit {
+                prefix_blocks: 0,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 57
+            }
+        );
+        assert_eq!(
+            credits[&w(3)],
+            PiCredit {
+                prefix_blocks: 63,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 28
+            }
+        );
+        assert_eq!(
+            credits[&w(9)],
+            PiCredit {
+                prefix_blocks: 0,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 57
+            }
+        );
+        // D-ROUTE-2: the credited PI equals the plan the stub sends to that rank.
+        for r in [1u64, 2, 3, 9] {
+            let plan = aware.plan(&input, w(r), 0).unwrap();
+            let c = &credits[&w(r)];
+            assert_eq!(
+                plan.predicted.pi / B,
+                c.pi_gpu_blocks + c.pi_dram_blocks,
+                "rank {r}"
+            );
+        }
+        // the stub credits nothing
+        assert!(StubPlanner.worker_credits(&input).is_empty());
+        // candidate_workers narrows the set
+        let narrowed = PlannerInput {
+            candidate_workers: Some(&[2, 3]),
+            ..input
+        };
+        let mut ranks: Vec<u64> = aware
+            .worker_credits(&narrowed)
+            .keys()
+            .map(|w| w.worker_id)
+            .collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![2, 3]);
+    }
+
+    #[test]
+    fn t10_1_aware_planner_params_and_registry() {
+        register_builtin_planners();
+        let p = resolve_planner("ckv-aware").unwrap();
+        assert_eq!(p.name(), AWARE_PLANNER);
+        let p = AwarePlanner::parse("gpu=1.0, dram=0.5").unwrap();
+        assert_eq!((p.gpu_weight, p.dram_weight), (Some(1.0), Some(0.5)));
+        assert!(AwarePlanner::parse("x=1").is_err());
+        assert!(AwarePlanner::parse("gpu=-1").is_err());
+        assert!(resolve_planner("ckv-aware:dram=0.7").is_ok());
+        assert_eq!(
+            resolve_planner("ckv-aware:dram=0.7")
+                .unwrap()
+                .credit_weights(),
+            (1.0, 0.7)
+        );
+        assert_eq!(
+            StubPlanner.credit_weights(),
+            (DEFAULT_PI_GPU_WEIGHT, DEFAULT_PI_DRAM_WEIGHT)
+        );
+        // weighted blocks: gpu 1.0, dram 0.5; ranks without PI are left out
+        let mut credits = HashMap::new();
+        credits.insert(
+            w(1),
+            PiCredit {
+                prefix_blocks: 3,
+                pi_gpu_blocks: 29,
+                pi_dram_blocks: 28,
+            },
+        );
+        credits.insert(
+            w(2),
+            PiCredit {
+                prefix_blocks: 63,
+                pi_gpu_blocks: 0,
+                pi_dram_blocks: 0,
+            },
+        );
+        let wb = weighted_credit_blocks(&credits, 1.0, 0.5);
+        assert_eq!(wb.len(), 1);
+        assert_eq!(wb[&w(1)], 29.0 + 14.0);
     }
 }

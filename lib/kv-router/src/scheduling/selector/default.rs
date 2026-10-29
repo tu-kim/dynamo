@@ -305,7 +305,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 1.0
             };
         let effective_overlap_score_credit = weights.overlap_score_credit * overlap_credit_decay;
-        let overlap_credit_blocks = effective_overlap_score_credit * device_overlap_blocks
+        // ComposableKV (F10, D-ROUTE-1): PI the rank would splice instead of
+        // prefilling counts like its device prefix hit, under the same decay.
+        let overlap_credit_blocks = effective_overlap_score_credit
+            * (device_overlap_blocks + cache.ckv_pi_credit_blocks)
             + kv_router_config.host_cache_hit_weight * cache.host_overlap_blocks
             + kv_router_config.disk_cache_hit_weight * cache.disk_overlap_blocks
             + shared_overlap_blocks;
@@ -2017,5 +2020,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.worker, worker0);
+    }
+
+    /// T10-2 (F10, D-ROUTE-1/3): the PI credit enters the logit exactly like
+    /// device overlap, under the same decay, and never below zero.
+    #[test]
+    fn t10_2_ckv_pi_credit_scores_like_device_overlap() {
+        let w0 = WorkerWithDpRank::from_worker_id(0);
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            prefill_load_scale: 1.0,
+            shared_cache_multiplier: 0.0,
+        };
+        // 64 blocks of prompt (block 16 -> isl 1024). w0: device prefix 24 blocks.
+        // w1: no prefix, PI credit 24 blocks. Same logit.
+        let mut request = base_request(1024);
+        request.overlap.effective_cached_tokens.insert(w0, 24 * 16);
+        request.overlap.tier_overlap_blocks.device.insert(w0, 24);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 24.0);
+        let l0 = worker_logit(&selector, &request, w0, 16, weights);
+        let l1 = worker_logit(&selector, &request, w1, 16, weights);
+        assert_eq!(l0, l1, "PI credit == device prefix credit");
+        assert_eq!(l0, 40.0);
+        // One more credited block wins; a fractional DRAM-weighted credit is honoured.
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 24.8);
+        assert!(worker_logit(&selector, &request, w1, 16, weights) < l0);
+        // D-ROUTE-3: credit beyond the prompt clamps at zero prefill cost, never negative.
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 1000.0);
+        assert_eq!(worker_logit(&selector, &request, w1, 16, weights), 0.0);
+        // With prefill backlog the credit is still subtracted from the raw prefill
+        // (64 own + 64 backlog = 128 blocks; the decay factor is shared with the
+        // device credit by construction and is 1 here: a lone rank sits at the
+        // load floor).
+        let decayed = LogitWeights {
+            overlap_score_credit_decay: 1.0,
+            ..weights
+        };
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 24.0);
+        request.worker_loads.insert(
+            w1,
+            crate::sequences::WorkerLoadProjection {
+                active_prefill_tokens: 1024,
+                active_decode_blocks: 0,
+                active_requests: 0,
+                additional_active_blocks: 0,
+            },
+        );
+        assert_eq!(worker_logit(&selector, &request, w1, 16, decayed), 104.0);
+        // Without the PI credit the same rank costs 128: the credit is what moved it.
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .remove(&w1);
+        assert_eq!(worker_logit(&selector, &request, w1, 16, decayed), 128.0);
+    }
+
+    /// T10-2: end-to-end selection with the credit (temperature 0).
+    #[test]
+    fn t10_2_select_prefers_the_rank_with_pi_credit() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let w0 = WorkerWithDpRank::from_worker_id(0);
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let config = KvRouterConfig {
+            overlap_score_credit: 1.0,
+            router_temperature: 0.0,
+            ..Default::default()
+        };
+        let selector = DefaultWorkerSelector::new(Some(config), "test");
+        let mut workers = HashMap::new();
+        workers.insert(0, SimpleWorkerConfig::default());
+        workers.insert(1, SimpleWorkerConfig::default());
+        let mut request = base_request(1024);
+        request.overlap.effective_cached_tokens.insert(w0, 8 * 16);
+        request.overlap.tier_overlap_blocks.device.insert(w0, 8);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 20.0);
+        let pick = |request: &SchedulingRequest| {
+            selector
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    request,
+                    request.eligibility(),
+                    16,
+                ))
+                .unwrap()
+                .worker
+        };
+        assert_eq!(pick(&request), w1, "20 PI blocks beat an 8-block prefix");
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .insert(w1, 4.0);
+        assert_eq!(pick(&request), w0, "8-block prefix beats 4 PI blocks");
+        request
+            .overlap
+            .tier_overlap_blocks
+            .ckv_pi_credit_blocks
+            .clear();
+        assert_eq!(pick(&request), w0, "no credit map: unchanged behaviour");
     }
 }
